@@ -1,10 +1,9 @@
-# Author: PB & Claude
-# Maintainer: PB
-# Original date: 2025.05.13
-# License: (c) HRDAG, 2025, GPL-2 or newer
-#
-# ------
-# README.md
+<!-- 
+  Author: PB & Claude
+  Maintainer: PB
+  Original date: 2025.05.13
+  License: (c) HRDAG, 2025, GPL-2 or newer
+ --> 
 
 # n2s - ZFS to S3 Encrypted Backup
 
