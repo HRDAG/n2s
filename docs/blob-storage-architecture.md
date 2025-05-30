@@ -1,4 +1,4 @@
-# Content-Addressable Backup System with Embedded Metadata
+# Blob Storage Architecture with Embedded Metadata
 
 ## Overview
 
@@ -115,20 +115,20 @@ import blake3
 import psycopg
 from pyrage import encrypt, decrypt
 
-# Create encrypted blob
-def create_blob(file_content: bytes, filepath: str, age_recipients: list) -> tuple[str, bytes]:
+# Create encrypted blob with passphrase
+def create_blob(file_content: bytes, filepath: str, passphrase: str) -> tuple[str, bytes]:
     content_hash = blake3.blake3(file_content).hexdigest()
     blob_data = {
         'content': file_content.hex(),
         'metadata': {'filepath': filepath, 'content_hash': content_hash}
     }
     json_bytes = json.dumps(blob_data).encode('utf-8')
-    encrypted_blob = encrypt(json_bytes, age_recipients)
+    encrypted_blob = encrypt(json_bytes, passphrase)
     return content_hash, encrypted_blob
 
 # Extract from encrypted blob  
-def extract_blob(encrypted_blob: bytes, identity: str) -> tuple[bytes, dict]:
-    decrypted = decrypt(encrypted_blob, [identity])
+def extract_blob(encrypted_blob: bytes, passphrase: str) -> tuple[bytes, dict]:
+    decrypted = decrypt(encrypted_blob, passphrase)
     blob_data = json.loads(decrypted.decode('utf-8'))
     file_content = bytes.fromhex(blob_data['content'])
     return file_content, blob_data['metadata']
@@ -141,6 +141,7 @@ def extract_blob(encrypted_blob: bytes, identity: str) -> tuple[bytes, dict]:
 - Age encryption tool: `age`
 - JSON processor: `jq`
 - Hex decoder: `xxd`
+- Passphrase for symmetric encryption
 
 ### Basic Recovery Process
 
@@ -148,15 +149,15 @@ def extract_blob(encrypted_blob: bytes, identity: str) -> tuple[bytes, dict]:
 # 1. List all blobs in storage
 aws s3 ls s3://backup-bucket/ --recursive | awk '{print $4}'
 
-# 2. Decrypt a specific blob
-age --decrypt --identity key.txt --armor < blob_file.age | jq '.'
+# 2. Decrypt a specific blob (will prompt for passphrase)
+age --decrypt blob_file.age | jq '.'
 
 # 3. Extract file content and save to original filename
-FILENAME=$(age --decrypt --identity key.txt blob_file.age | jq -r '.metadata.filepath | split("/") | .[-1]')
-age --decrypt --identity key.txt blob_file.age | jq -r '.content' | xxd -r -p > "$FILENAME"
+FILENAME=$(age --decrypt blob_file.age | jq -r '.metadata.filepath | split("/") | .[-1]')
+age --decrypt blob_file.age | jq -r '.content' | xxd -r -p > "$FILENAME"
 
 # 4. View metadata only
-age --decrypt --identity key.txt blob_file.age | jq '.metadata'
+age --decrypt blob_file.age | jq '.metadata'
 ```
 
 ### Full Recovery Script
@@ -165,7 +166,6 @@ age --decrypt --identity key.txt blob_file.age | jq '.metadata'
 #!/bin/bash
 # disaster_recovery.sh - Recover all files from backup storage
 
-IDENTITY_KEY="key.txt"
 STORAGE_PREFIX="s3://backup-bucket/"
 OUTPUT_DIR="./recovered_files"
 
@@ -179,8 +179,8 @@ recover_blob() {
     # Download blob
     aws s3 cp "${STORAGE_PREFIX}${blob_hash}" /tmp/blob.age
     
-    # Decrypt and extract metadata
-    local metadata=$(age --decrypt --identity "$IDENTITY_KEY" /tmp/blob.age | jq -c '.metadata')
+    # Decrypt and extract metadata (will prompt for passphrase)
+    local metadata=$(age --decrypt /tmp/blob.age | jq -c '.metadata')
     local filepath=$(echo "$metadata" | jq -r '.filepath')
     local dataset=$(echo "$metadata" | jq -r '.dataset')
     local snapshot=$(echo "$metadata" | jq -r '.snapshot')
@@ -190,7 +190,7 @@ recover_blob() {
     mkdir -p "$(dirname "$output_path")"
     
     # Extract file content
-    age --decrypt --identity "$IDENTITY_KEY" /tmp/blob.age | \
+    age --decrypt /tmp/blob.age | \
         jq -r '.content' | xxd -r -p > "$output_path"
     
     echo "Recovered: $output_path"
@@ -210,8 +210,8 @@ echo "Recovery complete. Files restored to: $OUTPUT_DIR"
 # 1. Download a blob from S3
 aws s3 cp s3://backup-bucket/a1b2c3d4e5f6789... ./blob.age
 
-# 2. Decrypt the blob
-age --decrypt --identity key.txt ./blob.age > decrypted.json
+# 2. Decrypt the blob (will prompt for passphrase)
+age --decrypt ./blob.age > decrypted.json
 
 # 3. View the structure
 cat decrypted.json | jq '.'
@@ -234,7 +234,7 @@ blake3sum recovered_report.pdf  # Should match metadata.content_hash
 
 ```bash
 # Rebuild database from all stored blobs
-python3 backup_system.py disaster-recovery --identity key.txt
+python3 backup_system.py disaster-recovery --passphrase
 ```
 
 ### Scenario 2: Lost Storage, Have Database
@@ -256,7 +256,7 @@ python3 backup_system.py backup-dataset --dataset documents --snapshot recovery
 
 ### Scenario 4: Complete Manual Recovery
 
-With only the age identity key and storage credentials:
+With only the passphrase and storage credentials:
 
 ```bash
 # 1. List all blobs
@@ -269,7 +269,8 @@ while read -r line; do
     blob=$(echo "$line" | awk '{print $4}')
     aws s3 cp "s3://backup-bucket/$blob" "/tmp/$blob"
     
-    metadata=$(age --decrypt --identity key.txt "/tmp/$blob" | jq -c '.metadata')
+    # Decrypt (will prompt for passphrase)
+    metadata=$(age --decrypt "/tmp/$blob" | jq -c '.metadata')
     filepath=$(echo "$metadata" | jq -r '.filepath')
     dataset=$(echo "$metadata" | jq -r '.dataset')
     snapshot=$(echo "$metadata" | jq -r '.snapshot')
@@ -277,7 +278,7 @@ while read -r line; do
     output_dir="./recovered/${dataset}/${snapshot}"
     mkdir -p "$(dirname "${output_dir}${filepath}")"
     
-    age --decrypt --identity key.txt "/tmp/$blob" | \
+    age --decrypt "/tmp/$blob" | \
         jq -r '.content' | xxd -r -p > "${output_dir}${filepath}"
     
     echo "Recovered: ${output_dir}${filepath}"
@@ -285,7 +286,7 @@ done < blob_list.txt
 EOF
 
 chmod +x recover_all.sh
-./recover_all.sh
+./recover_all.sh  # Will prompt for passphrase for each blob
 ```
 
 ## Benefits
@@ -300,11 +301,12 @@ chmod +x recover_all.sh
 
 ## Security Considerations
 
-- Age encryption provides strong protection for blob contents
+- Age symmetric encryption provides strong protection for blob contents
 - Content hashes are not sensitive (they're deterministic)
 - Filepath information is encrypted within blobs
-- Recovery requires both storage access AND encryption key
-- Consider using multiple age recipients for key redundancy
+- Recovery requires both storage access AND passphrase
+- Consider using a strong, memorable passphrase or secure passphrase manager
+- Store passphrase separately from storage credentials for security
 
 ## Performance Characteristics
 
