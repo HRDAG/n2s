@@ -18,7 +18,7 @@ The architecture separates concerns: clients handle file discovery, n2s handles 
 **Clients - File Discovery Layer:**
 - **dsg**: Store versioned data repositories
 - **ZFS or btrfs snapshots**: backup incremental filesystem changes between snapshots
-- **Find-based scanning**: Schedule regular backups of modified files in any directory tree
+- **Find-based scanning**: Schedule regular backups of recently modified files in any directory tree
 
 **n2s - Storage Coordination Layer:**
 - **API operations**: Provides push, pull, list, and search operations for clients
