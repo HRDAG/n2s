@@ -28,6 +28,8 @@
 - Avoid mocking when possible, use real function calls and fixtures
 - Get tests passing before moving to next step
 - Each step should be small and verifiable
+- check existing code! don't propose new code until you confirm that we don't have that functionality already. 
+- keep the code **DRY**
 - Refactor only after tests pass
 - Consider edge cases before marking a task complete
 
