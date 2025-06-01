@@ -35,7 +35,8 @@ This document outlines three new documentation files that would complete the n2s
 ## 2. configuration.md
 
 **Purpose**: Complete reference for all configuration options in TOML format.
-
+TODO: TOML or yml? 
+TODO: how would this config work in a `.dsgconfig.yml` file? 
 **Content to include**:
 - Full TOML configuration schema
 - All sections with descriptions:
