@@ -205,6 +205,7 @@ The Service Manager uses an ORM layer for database interaction, making local vs 
 ### Configuration
 - All configuration stored in TOML files including backend credentials and encryption keys
 - Service Manager loads config at startup and maintains in memory
+- See `configuration.md` (TODO) for complete configuration reference and examples
 
 ### Core Operations
 - **Content Operations**: BLAKE3 hashing and encryption/decryption (see `blob-storage-architecture.md`)

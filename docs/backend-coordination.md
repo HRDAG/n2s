@@ -9,15 +9,11 @@
 
 ## Overview
 
-The Service Manager coordinates storage operations across multiple backend providers (S3, IPFS, rclone, local filesystem) with robust handling of partial failures, network issues, and recovery scenarios. This is critical for reliable data storage when dealing with large datasets and unreliable networks.
+The Service Manager coordinates storage operations across multiple backend providers with robust handling of partial failures, network issues, and recovery scenarios. This is critical for reliable data storage when dealing with large datasets and unreliable networks.
 
-## Backend Providers
+## Backend Provider Implementation
 
-### Supported Backends
-- **S3**: Object storage with content-addressable keys
-- **IPFS**: Distributed storage with CID mapping  
-- **rclone**: Any rclone-supported backend (Google Drive, Dropbox, etc.)
-- **Local Filesystem**: Direct file storage for development/testing
+This document covers the implementation details of backend coordination. For the backend interface definition and list of supported backends, see the Backend Provider Layer section in `service-architecture.md`.
 
 ### Backend Configuration
 Each backend provider is configured in TOML with credentials and settings:

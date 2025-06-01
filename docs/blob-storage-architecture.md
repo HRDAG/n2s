@@ -48,7 +48,9 @@ Each encrypted blob contains a JSON structure:
 
 ## Database Schema
 
-The database separates blob storage tracking from file path mappings to enable deduplication:
+This document focuses on the blob storage and encryption layer. For the complete database schema including changesets and backend tracking tables, see the Database Schema section in `service-architecture.md`.
+
+The core blob storage tables enable deduplication:
 
 - **blobs table**: One record per unique content hash (deduplicated storage)
 - **files table**: One record per file path in each dataset/snapshot (many-to-one with blobs)
@@ -60,8 +62,6 @@ CREATE TABLE blobs (
     content_hash TEXT PRIMARY KEY,              -- BLAKE3 hash of original content
     size BIGINT NOT NULL,                       -- Original file size in bytes
     encrypted_size BIGINT NOT NULL,             -- Encrypted blob size in bytes
-    s3_key TEXT,                               -- S3 object key (same as content_hash)
-    ipfs_cid TEXT,                             -- IPFS Content ID for encrypted blob
     first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -73,6 +73,7 @@ CREATE TABLE files (
     filepath TEXT NOT NULL,                    -- Original file path
     content_hash TEXT NOT NULL,                -- References blobs.content_hash
     mtime TIMESTAMP WITH TIME ZONE NOT NULL,   -- File modification time
+    changeset_id UUID NOT NULL,                -- References changesets.id (see service-architecture.md)
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     
     PRIMARY KEY (dataset, snapshot, filepath),
@@ -81,9 +82,14 @@ CREATE TABLE files (
 
 -- Indexes for common queries
 CREATE INDEX idx_files_content_hash ON files(content_hash);
-CREATE INDEX idx_files_dataset_snapshot ON files(dataset, snapshot);
-CREATE INDEX idx_blobs_first_seen ON blobs(first_seen);
+CREATE INDEX idx_files_changeset_id ON files(changeset_id);
 ```
+
+**Note**: The complete schema includes two additional tables:
+- **changesets**: Groups of related operations with backend push status
+- **blob_backends**: Per-blob, per-backend upload tracking for partial transmission recovery
+
+See `service-architecture.md` for the full 4-table schema and backend coordination details.
 
 ### Deduplication Example
 
