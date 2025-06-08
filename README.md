@@ -9,9 +9,9 @@
 
 ## Overview
 
-n2s is a deduplicating storage service. It connects version-based and incrementally updating data sources with any storage backend. It discovers changed files through clients (`dsg` repositories, ZFS/btrfs snapshots, or filesystem scanning), encrypts and deduplicates the content, then pushes it to one or several possible backends (S3-compatible, IPFS, rclone-supported services, or local archives) with upload tracking and restart capability. A database tracks all operations, enabling fast queries about what's stored where and when the upload was confirmed.
+n2s is a storage coordination service. It connects version-based and incrementally updating data sources with any storage backend. It discovers changed files through clients (`dsg` repositories, ZFS/btrfs snapshots, or filesystem scanning), encrypts the content with path-aware blob creation, then pushes it to configured backends (S3-compatible, IPFS, rclone-supported services, or local archives) with upload tracking and restart capability. A database tracks all operations, enabling fast queries about what's stored where and when the upload was confirmed.
 
-All content is hashed using BLAKE3, ensuring that data integrity can be verified at every point in the system. Clients push data to backends in units called changesets, which represent the state of the client's data at a specific time. This design enables partial upload recovery, efficient deduplication, and point-in-time restoration.
+All content is hashed using BLAKE3, ensuring that data integrity can be verified at every point in the system. Clients push data to backends in units called changesets, which represent the state of the client's data at a specific time. The simplified architecture prioritizes operational reliability and disaster recovery over storage deduplication.
 
 The architecture separates concerns: clients handle file discovery, n2s handles storage logistics, and backends handle the actual bytes. This design supports everything from single-user laptop backups to organization-wide data preservation workflows.
 
@@ -22,13 +22,36 @@ The architecture separates concerns: clients handle file discovery, n2s handles 
 
 **n2s - Storage Coordination Layer:**
 - **API operations**: Provides push, pull, list, and search operations for clients
-- **Data management**: Handles encryption, file-level deduplication, and content-addressable storage
+- **Data management**: Handles encryption and path-aware content-addressable storage
 - **State tracking**: Manages database records of what's stored, where, and when
 
 **Backends - Storage Layer:**
 - **Cloud storage**: S3-compatible for reliable object storage
 - **Distributed storage**: IPFS for content-addressed peer-to-peer storage
 - **Flexible destinations**: Any rclone-supported backend (Google Drive, Dropbox, etc.) or unix filesystems (local or SSH)
+
+## Simplified Architecture
+
+n2s uses a simplified 2-table design optimizing for operational simplicity:
+- **Path-aware blob creation**: Same content at different paths creates different blobs, enabling disaster recovery without database dependency
+- **Deterministic operations**: Identical content at same path always produces same blob ID (same file hash + same path = same blob)
+- **Single backend per database**: Eliminates complex coordination overhead
+- **Resume capability**: Simple retry logic for failed uploads
+
+This design trades storage efficiency for operational reliability - you can always recover your data with minimal tooling.
+
+### Storage Features
+- **Path-aware content-addressable storage**: Files identified by BLAKE3(path:file_hash)
+- **Deterministic blob creation**: Identical content at same path always produces same blob ID
+- **Multiple backends**: Store to S3, IPFS, rclone-supported services, or local storage  
+- **ChaCha20-Poly1305 encryption**: All content encrypted before storage with deterministic key derivation
+- **Disaster recovery**: Complete system rebuild from storage and encryption keys alone
+
+### Database Schema
+
+The system uses a simplified 2-table design:
+- **changesets**: Groups of files pushed together with status tracking
+- **files**: File records with upload status and blob references
 
 ### Deeper Dive
 

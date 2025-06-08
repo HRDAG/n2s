@@ -9,7 +9,7 @@
 
 ## Overview
 
-n2s is reimagined as a storage service with clear layer separation, providing an API for clients that want to store data while maintaining state through a metadata database and supporting multiple backend storage providers.
+n2s is a simplified storage coordination service with clear layer separation, providing an API for clients that want to store data while maintaining state through a local metadata database and a single configured backend storage provider per deployment.
 
 ## Component Layers
 
@@ -39,20 +39,20 @@ n2s is reimagined as a storage service with clear layer separation, providing an
 ### 2a. Service Manager Layer
 - **Purpose**: Business logic and coordination between frontend and backends
 - **Responsibilities**:
-  - Content hashing (BLAKE3) and deduplication
-  - Encryption/decryption operations
+  - Content hashing (BLAKE3) and path-aware blob creation  
+  - Encryption/decryption operations (ChaCha20-Poly1305)
   - Changeset creation and management
-  - Backend provider coordination and failover
-  - Configuration management (credentials, backend addresses, encryption keys)
+  - Single backend coordination
+  - Configuration management (credentials, backend address, encryption keys)
 - **State**: Configuration and credentials, but stateless for operations
 
 ### 2b. Metadata Database Layer
 - **Purpose**: Persistent storage of metadata and state
 - **Responsibilities**:
-  - Store changeset, blob, and file metadata
-  - Track backend push status and completion
+  - Store changeset and file metadata (2-table design)
+  - Track upload status with start/finish timestamps
   - Provide ACID transactions for consistency
-- **Storage**: PostgreSQL (production) or SQLite (development/single-user)
+- **Storage**: SQLite databases located at `{n2sroot}/.n2s/{backend_name}-manifest.db`
 - **Interface**: ORM layer for database abstraction
 
 #### ORM Decoupling Benefits
@@ -61,24 +61,26 @@ n2s is reimagined as a storage service with clear layer separation, providing an
 - **Testing**: In-memory SQLite for fast unit tests
 - **Development**: No PostgreSQL setup required for local development
 
-#### Connection Configuration Examples
+#### Database Location Pattern
 ```toml
-# Single-user/development
-[database]
-url = "sqlite:///local/n2s.db"
+# Configuration specifies backend and n2sroot
+[backend]
+name = "s3-prod"
+n2sroot = "/data"
 
-# Production PostgreSQL
-[database] 
-url = "postgresql://n2s_user:password@db.example.com:5432/n2s_prod"
-
-# Distributed deployment
-[database]
-url = "postgresql://n2s_user:password@db-cluster.internal:5432/n2s"
-pool_size = 20
+# Database automatically created at:
+# {n2sroot}/.n2s/{backend_name}-manifest.db
+# Example: /data/.n2s/s3-prod-manifest.db
 ```
 
+**Benefits of local SQLite databases:**
+- **Travels with data**: Database stays with the file tree being tracked  
+- **Backend isolation**: Multiple backends can operate on same n2sroot
+- **No infrastructure**: No PostgreSQL setup required
+- **Multi-process safe**: SQLite WAL mode handles concurrent workers
+
 ### 3. Backend Provider Layer
-- **Purpose**: Multiple storage backends for redundancy and flexibility
+- **Purpose**: Single storage backend per database deployment for operational simplicity
 - **Supported Providers**:
   - **S3**: Object storage with content-addressable keys
   - **IPFS**: Distributed storage with CID mapping
@@ -304,100 +306,94 @@ validate(project: str, dataset: str, pattern: str = None, sample_rate: int = Non
 # Downloads and verifies blob hashes for corruption detection
 ```
 
-## Database Schema Updates
+## Simplified Database Schema (2-Table Design)
 
-With partial transmission tracking, we now need 4 tables:
+The n2s simplified architecture uses only 2 tables for operational simplicity:
 
-### 1. changesets - Groups of related operations
+### 1. changesets - Changeset Tracking
+
 ```sql
 CREATE TABLE changesets (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- Identification
-    project TEXT NOT NULL,                      -- "dsg", "zfs-backup", etc.
-    dataset TEXT NOT NULL,                      -- Source dataset name
-    source_snapshot TEXT,                       -- ZFS snapshot, git commit, etc.
-    client_id TEXT,                            -- Which client initiated this
-    
-    -- Timing
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    started_at TIMESTAMP WITH TIME ZONE,       -- When push began
-    completed_at TIMESTAMP WITH TIME ZONE,     -- When push finished
-    
-    -- Status tracking  
-    status TEXT NOT NULL DEFAULT 'pending',    -- pending, pushing, completed, failed
-    file_count INTEGER DEFAULT 0,              -- Number of files in this changeset
-    blob_count INTEGER DEFAULT 0,              -- Number of unique blobs
-    total_size BIGINT DEFAULT 0,               -- Total bytes (original content)
-    
-    -- Backend tracking
-    backends_pushed TEXT[],                     -- Array of completed backends
-    backends_failed TEXT[],                     -- Array of failed backends
-    
-    -- Metadata
-    description TEXT,                           -- Human readable description
-    metadata JSONB                              -- Flexible additional data
+    changeset_id TEXT PRIMARY KEY,                  -- hash(name, sorted_file_list)
+    name TEXT NOT NULL,                             -- Human-readable changeset name
+    content_hash TEXT NOT NULL,                     -- hash(sorted_file_ids) - changeset content signature
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    file_count INTEGER DEFAULT 0,                   -- Number of files processed
+    total_size INTEGER DEFAULT 0,                   -- Total original bytes
+    status TEXT DEFAULT 'pending'                   -- pending, processing, completed, failed
 );
-
-CREATE INDEX idx_changesets_project_dataset ON changesets(project, dataset);
-CREATE INDEX idx_changesets_status ON changesets(status);
-CREATE INDEX idx_changesets_created_at ON changesets(created_at);
 ```
 
-### 2. blobs - Content-addressable storage
-```sql
--- From blob-storage-architecture.md
-CREATE TABLE blobs (
-    content_hash TEXT PRIMARY KEY,              -- BLAKE3 hash of original content
-    size BIGINT NOT NULL,                       -- Original file size in bytes
-    encrypted_size BIGINT NOT NULL,             -- Encrypted blob size in bytes
-    first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+### 2. files - File Records
 
-CREATE INDEX idx_blobs_first_seen ON blobs(first_seen);
-```
-
-### 3. files - File path mappings
 ```sql
--- From blob-storage-architecture.md with changeset_id added
 CREATE TABLE files (
-    dataset TEXT NOT NULL,                     -- Dataset name (e.g., "documents")
-    snapshot TEXT NOT NULL,                    -- Snapshot identifier (e.g., timestamp)
-    filepath TEXT NOT NULL,                    -- Original file path
-    content_hash TEXT NOT NULL,                -- References blobs.content_hash
-    mtime TIMESTAMP WITH TIME ZONE NOT NULL,   -- File modification time
-    changeset_id UUID NOT NULL,               -- References changesets.id
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    path TEXT NOT NULL,                             -- Relative file path
+    changeset_id TEXT NOT NULL,                     -- References changesets.changeset_id
+    size INTEGER NOT NULL,                          -- Original file size
+    mtime TIMESTAMP NOT NULL,                       -- File modification time  
+    file_hash TEXT NOT NULL,                        -- BLAKE3 hash of original content
+    file_id TEXT NOT NULL,                          -- hash(path:file_hash) - storage key
+    upload_start_tm TIMESTAMP,                      -- When upload began
+    upload_finish_tm TIMESTAMP,                     -- When upload completed
     
-    PRIMARY KEY (dataset, snapshot, filepath),
-    FOREIGN KEY (content_hash) REFERENCES blobs(content_hash),
-    FOREIGN KEY (changeset_id) REFERENCES changesets(id)
+    PRIMARY KEY (path, changeset_id),
+    FOREIGN KEY (changeset_id) REFERENCES changesets(changeset_id)
 );
 
-CREATE INDEX idx_files_content_hash ON files(content_hash);
-CREATE INDEX idx_files_changeset_id ON files(changeset_id);
+-- Indexes for performance
+CREATE INDEX idx_files_upload_status ON files(upload_finish_tm);
+CREATE INDEX idx_files_file_id ON files(file_id);
+CREATE INDEX idx_changesets_status ON changesets(status);
 ```
 
-### 4. blob_backends - Per-blob, per-backend status tracking
-```sql
--- New table for partial transmission recovery
-CREATE TABLE blob_backends (
-    blob_hash TEXT REFERENCES blobs(content_hash),
-    backend TEXT,
-    status TEXT, -- 'pending', 'completed', 'failed'
-    attempted_at TIMESTAMP WITH TIME ZONE,
-    completed_at TIMESTAMP WITH TIME ZONE,
-    error_message TEXT,                         -- Last error if failed
-    retry_count INTEGER DEFAULT 0,
-    PRIMARY KEY (blob_hash, backend)
-);
+**Upload State Management:**
+- `upload_start_tm=NULL, upload_finish_tm=NULL` → Not started
+- `upload_start_tm=X, upload_finish_tm=NULL` → In progress (or stuck)  
+- `upload_start_tm=X, upload_finish_tm=Y` → Completed in (Y-X) time
 
-CREATE INDEX idx_blob_backends_status ON blob_backends(status);
-CREATE INDEX idx_blob_backends_backend ON blob_backends(backend);
-```
+**For complete blob creation details, see:**
+- [Simplified Architecture](simplified-architecture.md) - 2-table design rationale
+- [Blob Creation Performance Analysis](blob-creation-performance-analysis.md) - ChaCha20-Poly1305 implementation and testing
 
-## Open Questions
+## Design Philosophy: Simplicity Over Complexity
 
-1. How should the service manager handle multiple backend providers?
-2. What's the optimal interface between layers (HTTP, gRPC, direct calls)?
-3. How do we handle backend provider failures and failover?
+The n2s simplified architecture prioritizes **operational reliability** over storage optimization:
+
+### Path-Aware Blob Creation
+
+**Key Decision**: `file_id = BLAKE3(path:file_hash)` creates path-aware blobs
+
+**Benefits:**
+- **Disaster recovery without database**: Blobs contain complete path information
+- **Deterministic operations**: Same content at same path always produces same blob
+- **Simple resume logic**: Re-process files where `upload_finish_tm IS NULL`
+- **No reference counting**: Eliminates complex blob lifecycle management
+
+**Trade-off accepted**: Same content at different paths creates separate blobs (storage duplication for operational simplicity)
+
+### Single Backend Per Database
+
+**Key Decision**: One backend per SQLite database instance
+
+**Benefits:**
+- **No coordination complexity**: Eliminates multi-backend failure scenarios
+- **Local database**: SQLite travels with the data at `{n2sroot}/.n2s/{backend}-manifest.db`
+- **Parallel processing**: Multiple workers can safely update different files
+- **Clear ownership**: Each deployment has simple 1:1 relationships
+
+**Scaling**: Deploy multiple database instances rather than coordinate shared state
+
+## Implementation Status
+
+### Completed Decisions
+1. **Backend coordination**: Single backend per database eliminates complex coordination
+2. **Database design**: 2-table SQLite schema with local manifest databases
+3. **Blob creation**: ChaCha20-Poly1305 encryption with path-aware deterministic blob IDs
+4. **Disaster recovery**: Complete recovery toolset with cross-platform Go binaries
+
+### Remaining Implementation
+1. **Frontend API**: RESTful API design and implementation
+2. **Service Manager**: Business logic and blob creation orchestration  
+3. **Client integrations**: DSG, ZFS, Btrfs, and Find client implementations
+4. **Configuration management**: TOML-based configuration with environment substitution
