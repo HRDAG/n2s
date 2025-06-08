@@ -5,10 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "blake3>=0.4.1",
+    "cryptography>=44.0.0",
     "loguru>=0.7.3",
+    "lz4>=4.3.3",
     "psycopg[binary]>=3.2.0",
     "pydantic>=2.11.5",
-    "pyrage>=1.2.5",
     "typer>=0.16.0",
 ]
 
