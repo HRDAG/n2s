@@ -1,10 +1,9 @@
-# Author: PB & Claude
-# Maintainer: PB
-# Original date: 2025.05.13
-# License: (c) HRDAG, 2025, GPL-2 or newer
-#
-# ------
-# recovery/README.md
+<!-- 
+  Author: PB & Claude
+  Maintainer: PB
+  Original date: 2025.06.08
+  License: (c) HRDAG, 2025, GPL-2 or newer
+ -->
 
 # n2s Disaster Recovery
 
@@ -194,17 +193,18 @@ done
 
 ## Dependencies
 
-**Required for recovery:**
+**Required for disaster recovery:**
 - `jq` - JSON processing  
 - `lz4` - LZ4 decompression
 - `b3sum` - BLAKE3 hash verification (Ubuntu package)
 - `touch` - Set file timestamps
+- **Decrypt binary** - ChaCha20 decryption utility (see Build section)
 
-**Platform auto-detection** selects correct decrypt binary.
-
-**For building tools:**
+**For building decrypt binary:**
 - Go 1.21+ compiler
 - Internet access for Go module downloads
+
+*Note: Once built, the decrypt binary is self-contained and requires no Go runtime.*
 
 ## Security Architecture
 

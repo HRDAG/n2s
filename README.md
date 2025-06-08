@@ -1,7 +1,7 @@
 <!-- 
   Author: PB & Claude
   Maintainer: PB
-  Original date: 2025.05.13
+  Original date: 2025.06.08
   License: (c) HRDAG, 2025, GPL-2 or newer
  --> 
 
@@ -56,8 +56,7 @@ The system uses a simplified 2-table design:
 ### Deeper Dive
 
 For detailed technical documentation:
-- [Service Architecture](docs/service-architecture.md) - Complete system design including API, database schema, and component interactions
-- [Simplified Architecture](docs/simplified-architecture.md) - 2-table design rationale and path-aware blob creation
+- [Architecture](docs/architecture.md) - Complete system design including components, database schema, API, and design decisions
 - [Blob Creation Performance Analysis](docs/blob-creation-performance-analysis.md) - ChaCha20-Poly1305 implementation and performance testing
 - [Disaster Recovery](recovery/README.md) - Complete disaster recovery guide with working tools
 

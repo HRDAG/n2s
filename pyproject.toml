@@ -1,7 +1,7 @@
 [project]
 name = "n2s"
 version = "0.1.0"
-description = "Add your description here"
+description = "Storage coordination service with path-aware blob creation and disaster recovery"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
