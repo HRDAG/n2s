@@ -57,8 +57,9 @@ The system uses a simplified 2-table design:
 
 For detailed technical documentation:
 - [Service Architecture](docs/service-architecture.md) - Complete system design including API, database schema, and component interactions
-- [Blob Storage Architecture](docs/blob-storage-architecture.md) - Encryption, deduplication, and disaster recovery design
-- [Backend Coordination](docs/backend-coordination.md) - Multi-backend push coordination, failure handling, and recovery workflows
+- [Simplified Architecture](docs/simplified-architecture.md) - 2-table design rationale and path-aware blob creation
+- [Blob Creation Performance Analysis](docs/blob-creation-performance-analysis.md) - ChaCha20-Poly1305 implementation and performance testing
+- [Disaster Recovery](recovery/README.md) - Complete disaster recovery guide with working tools
 
 ## Installation
 
