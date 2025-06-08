@@ -19,16 +19,18 @@ This document analyzes the performance characteristics of n2s blob creation, doc
 Original File → LZ4 Compress → ChaCha20-Poly1305 Encrypt → Base64 Encode → JSON with Metadata → Write Blob
 ```
 
+**Reference implementation**: [scripts/blob_test.py](../scripts/blob_test.py)
+
 ### Implementation Details
 
 1. **File Reading**: Read entire file content into memory
 2. **LZ4 Compression**: Compress file content using LZ4 frame format  
-3. **Blobid Generation**: `BLAKE3(path:file_hash)` creates deterministic identifier
+3. **Blobid Generation**: `BLAKE3(path:file_hash)` creates deterministic identifier (path-aware blob ID)
 4. **Key Derivation**: PBKDF2-HMAC-SHA256 with salt from blobid (100k iterations)
 5. **ChaCha20-Poly1305 Encryption**: Encrypt compressed content with deterministic nonce from blobid
 6. **Base64 Encoding**: Convert encrypted bytes to ASCII string
 7. **JSON Structure**: Combine encrypted content with plaintext metadata
-8. **Blob Writing**: Write JSON to file named with blobid
+8. **Blob Writing**: Write JSON to file named with blobid (`BLAKE3(path:file_hash)`)
 
 ### Blob Structure
 
@@ -45,10 +47,11 @@ Original File → LZ4 Compress → ChaCha20-Poly1305 Encrypt → Base64 Encode �
 ```
 
 **Key Design Decisions:**
+- **Path-aware blob IDs**: `BLAKE3(path:file_hash)` ensures same content at different paths creates different blobs
 - **Plaintext metadata**: Enables disaster recovery without decryption
 - **Encrypted content only**: Smaller encryption payload, better performance
 - **Base64 encoding**: JSON compatibility with acceptable 33% overhead
-- **Deterministic encryption**: Same file always produces same blob
+- **Deterministic encryption**: Same file at same path always produces identical blob
 
 ## Performance Benchmarks
 
@@ -86,7 +89,7 @@ Original File → LZ4 Compress → ChaCha20-Poly1305 Encrypt → Base64 Encode �
 
 ### Approach
 
-Derive both PBKDF2 salt and ChaCha20 nonce deterministically from the blobid:
+Derive both PBKDF2 salt and ChaCha20 nonce deterministically from the blobid (`BLAKE3(path:file_hash)`):
 
 ```python
 blob_bytes = bytes.fromhex(blobid)
@@ -104,7 +107,7 @@ nonce = blob_bytes[-12:] # Last 12 bytes for ChaCha20 nonce
 ### Benefits
 
 - **Deterministic blobs**: Same file content at same path always produces identical encrypted blob
-- **Deduplication**: Path-aware blob creation with consistent encryption
+- **Path-aware deduplication**: Different paths create different blobs (`BLAKE3(path:file_hash)`)
 - **Disaster recovery**: No random state needed for blob recreation
 
 ## Testing Methodology
