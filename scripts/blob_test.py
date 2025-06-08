@@ -17,15 +17,15 @@ from typing import Dict, Any, List
 
 import blake3
 import typer
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
 PASSPHRASE: str = "123456"
 
 
-def encrypt_content(data: bytes, password: str, blobid: str) -> str:
-    """Encrypt file content and return base64 encoded string."""
+def encrypt_AESGCM(data: bytes, password: str, blobid: str) -> str:
+    """Encrypt file content with AES-GCM and return base64 encoded string."""
     # blobid is already a hexdigest, convert to bytes
     blob_bytes = bytes.fromhex(blobid)
     
@@ -43,16 +43,36 @@ def encrypt_content(data: bytes, password: str, blobid: str) -> str:
     return base64.b64encode(encrypted_data).decode('ascii')
 
 
+def encrypt_chacha(data: bytes, password: str, blobid: str) -> str:
+    """Encrypt file content with ChaCha20-Poly1305 and return base64 encoded string."""
+    # blobid is already a hexdigest, convert to bytes
+    blob_bytes = bytes.fromhex(blobid)
+    
+    salt = blob_bytes[:16]   # First 16 bytes for salt
+    nonce = blob_bytes[-12:] # Last 12 bytes for nonce
+    
+    # Derive key
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
+    key = kdf.derive(password.encode())
+    
+    chacha = ChaCha20Poly1305(key)
+    encrypted_data = chacha.encrypt(nonce, data, None)
+    
+    # Return base64 encoded string
+    return base64.b64encode(encrypted_data).decode('ascii')
+
+
 def create_blob(
-    file_path: str, metadata: Dict[str, Any], dest_dir: str
+    file_path: str, metadata: Dict[str, Any], dest_dir: str, algorithm: str = "aesgcm"
 ) -> tuple[str, float, Dict[str, float]]:
     """
-    Create blob from file: read → lz4 compress → age encrypt → JSON wrap.
+    Create blob from file: read → lz4 compress → encrypt → JSON wrap.
     
     Args:
         file_path: Path to source file
         metadata: Dict with path, size, timestamp, file_hash
         dest_dir: Directory to write blob file
+        algorithm: Encryption algorithm ("aesgcm" or "chacha")
         
     Returns:
         (blobid, total_time, timing_breakdown)
@@ -80,7 +100,12 @@ def create_blob(
     
     # Encrypt compressed content only
     start = time.perf_counter()
-    encrypted_content_b64 = encrypt_content(compressed, PASSPHRASE, blobid)
+    if algorithm == "aesgcm":
+        encrypted_content_b64 = encrypt_AESGCM(compressed, PASSPHRASE, blobid)
+    elif algorithm == "chacha":
+        encrypted_content_b64 = encrypt_chacha(compressed, PASSPHRASE, blobid)
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
     timings['encrypt'] = time.perf_counter() - start
     
     # Create JSON blob with plaintext metadata
@@ -139,7 +164,7 @@ def format_throughput(size_bytes: int, time_seconds: float) -> str:
 
 
 def process_files(
-    file_paths: List[str], dest_dir: str, csv_output: str, verbose: bool = False
+    file_paths: List[str], dest_dir: str, csv_output: str, algorithm: str = "aesgcm", verbose: bool = False
 ) -> None:
     """Process multiple files and write results to CSV."""
     
@@ -159,7 +184,7 @@ def process_files(
         
         # Create blob
         blobid, total_time, timings = create_blob(
-            file_path, metadata, dest_dir
+            file_path, metadata, dest_dir, algorithm
         )
         
         # Get blob size
@@ -259,9 +284,14 @@ def main(
     file_list: str = typer.Argument(..., help="File containing list of paths (one per line)"),
     dest_dir: str = typer.Option("./blobs", help="Output directory for blobs"),
     csv_output: str = typer.Option("blob_performance.csv", help="CSV output file"),
+    algorithm: str = typer.Option("aesgcm", help="Encryption algorithm: aesgcm or chacha"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-file progress")
 ):
     """Test blob creation performance for files listed in a file."""
+    
+    if algorithm not in ["aesgcm", "chacha"]:
+        typer.echo(f"Error: Invalid algorithm '{algorithm}'. Must be 'aesgcm' or 'chacha'", err=True)
+        raise typer.Exit(1)
     
     if not os.path.exists(file_list):
         typer.echo(f"Error: File list {file_list} not found", err=True)
@@ -276,7 +306,8 @@ def main(
         raise typer.Exit(1)
     
     typer.echo(f"Found {len(file_paths)} files in {file_list}")
-    process_files(file_paths, dest_dir, csv_output, verbose)
+    typer.echo(f"Using {algorithm.upper()} encryption")
+    process_files(file_paths, dest_dir, csv_output, algorithm, verbose)
 
 
 if __name__ == "__main__":
