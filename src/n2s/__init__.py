@@ -6,6 +6,6 @@
 # ------
 # src/n2s/__init__.py
 
-"""n2s package."""
+"""n2s: Storage coordination service with path-aware blob creation."""
 
 __version__ = "0.1.0"

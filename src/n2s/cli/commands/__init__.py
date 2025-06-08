@@ -4,11 +4,6 @@
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
-# main.py
+# src/n2s/cli/commands/__init__.py
 
-"""Entry point for n2s CLI."""
-
-from n2s.cli.main import app
-
-if __name__ == "__main__":
-    app()
+"""CLI commands for n2s."""

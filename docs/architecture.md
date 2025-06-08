@@ -34,30 +34,60 @@ n2s is a storage coordination service that connects version-based data sources w
 
 ## Component Architecture
 
-### Client Layer
-**Purpose**: File discovery and workflow management
+n2s is primarily a **library** for storage coordination, with a CLI interface for development and debugging. External clients handle domain-specific file discovery and workflow logic.
 
-**Client Types**:
-- **DSG Client**: Data versioning system (Git-like for data) - primary HRDAG workflow tool
-- **ZFS Client**: Uses `zfs diff` between snapshots for incremental backup
-- **Btrfs Client**: Uses `btrfs subvolume find-new` for snapshot-based incremental backup  
-- **Find Client**: Uses `find -mtime` for time-based file discovery
+### External Clients (User-Specific)
+**Purpose**: Domain-specific file discovery and workflow management
+
+**Client Examples**:
+```python
+# DSG client - Git-like data workflows
+dsg_files = discover_files_from_dsg_status()
+n2s.push_changeset("dsg-daily", dsg_files)
+
+# ZFS client - Snapshot-based incremental backup
+zfs_changes = zfs_diff("tank/data@yesterday", "tank/data@today") 
+n2s.push_changeset("zfs-incremental", zfs_changes)
+
+# Custom client - Project-specific workflow
+project_files = find_changed_files_since_last_backup()
+n2s.push_changeset("project-backup", project_files)
+```
 
 **Responsibilities**:
-- Discover changed/new files using various strategies
-- Provide dataset identification and metadata
-- Handle user workflow and configuration
-- Call n2s API for storage operations
+- Discover changed/new files using domain-specific strategies
+- Handle user workflow and policy decisions
+- Call n2s library API for storage operations
+- Manage configuration and credentials
 
-### Frontend API Layer
-**Purpose**: Clean interface for clients that want to store things
+### CLI Layer
+**Purpose**: Development, debugging, and simple use cases
+
+**Commands**:
+```bash
+n2s push [files...] --changeset-name NAME --config CONFIG
+n2s pull --changeset-id ID --target-path PATH  
+n2s status --backend NAME [--changeset-id ID]
+```
+
+**Usage**: Primarily for development and manual operations, not the main interface
+
+### Library API Layer  
+**Purpose**: Clean programmatic interface for external clients
+
+**Core Methods**:
+```python
+# Primary library interface
+service.push_changeset(name: str, file_paths: List[str]) -> str
+service.pull_changeset(changeset_id: str, target_path: str)
+service.get_changeset_status(changeset_id: str) -> dict
+```
 
 **Responsibilities**: 
-- Accept storage requests from clients
+- Accept storage requests from external clients
 - Validate input data and metadata
 - Return storage confirmations and retrieval responses
-
-**Interface**: RESTful API, gRPC, or library bindings
+- Provide clean abstraction over service layer
 
 ### Service Manager Layer
 **Purpose**: Business logic and coordination
@@ -78,13 +108,19 @@ n2s is a storage coordination service that connects version-based data sources w
 ### Database Layer
 **Purpose**: Persistent storage of metadata and state
 
-**Implementation**: SQLite databases located at `{n2sroot}/.n2s/{backend_name}-manifest.db`
+**Implementation**: SQLAlchemy abstraction over embedded databases at `{n2sroot}/.n2s/{backend_name}-manifest.db`
 
-**Benefits of local SQLite databases:**
+**Database Options**:
+- **SQLite**: Default embedded database (travels with data)
+- **In-memory SQLite**: For testing (`sqlite:///:memory:`)
+- **Future options**: DuckDB for analytics, other embedded databases
+
+**Benefits of embedded database approach:**
 - **Travels with data**: Database stays with the file tree being tracked  
 - **Backend isolation**: Multiple backends can operate on same n2sroot
-- **No infrastructure**: No PostgreSQL setup required
+- **No infrastructure**: No external database setup required
 - **Multi-process safe**: SQLite WAL mode handles concurrent workers
+- **Database portability**: SQLAlchemy enables different embedded databases
 
 **Responsibilities**:
 - Store changeset and file metadata (2-table design)
@@ -123,10 +159,14 @@ CREATE TABLE changesets (
 CREATE TABLE files (
     path TEXT NOT NULL,                             -- Relative file path
     changeset_id TEXT NOT NULL,                     -- References changesets.changeset_id
-    size INTEGER NOT NULL,                          -- Original file size
+    st_dev INTEGER NOT NULL,                        -- Device number (st_dev)
+    st_inode INTEGER NOT NULL,                      -- Inode number (st_ino)
+    size INTEGER NOT NULL,                          -- Original file size (or symlink target length)
     mtime TIMESTAMP NOT NULL,                       -- File modification time  
-    file_hash TEXT NOT NULL,                        -- BLAKE3 hash of original content
-    file_id TEXT NOT NULL,                          -- hash(path:file_hash) - storage key
+    file_hash TEXT NOT NULL,                        -- BLAKE3 hash of content or symlink target
+    file_id TEXT NOT NULL,                          -- Storage key (shared across hardlink groups)
+    is_canonical BOOLEAN NOT NULL,                  -- TRUE for canonical path in hardlink group
+    is_symlink BOOLEAN DEFAULT FALSE,               -- TRUE for symbolic links
     upload_start_tm TIMESTAMP,                      -- When upload began
     upload_finish_tm TIMESTAMP,                     -- When upload completed
     
@@ -137,6 +177,7 @@ CREATE TABLE files (
 -- Indexes for performance
 CREATE INDEX idx_files_upload_status ON files(upload_finish_tm);
 CREATE INDEX idx_files_file_id ON files(file_id);
+CREATE INDEX idx_files_hardlinks ON files(st_dev, st_inode);
 CREATE INDEX idx_changesets_status ON changesets(status);
 ```
 
@@ -161,6 +202,7 @@ Original File → LZ4 Compress → ChaCha20-Poly1305 Encrypt → Base64 Encode �
 
 ### Blob Structure
 
+**Regular Files:**
 ```json
 {
   "encrypted_content": "base64_encoded_encrypted_compressed_data",
@@ -168,7 +210,22 @@ Original File → LZ4 Compress → ChaCha20-Poly1305 Encrypt → Base64 Encode �
     "path": "relative/path/to/file.txt",
     "size": 12345,
     "timestamp": 1749388804.3256009,
-    "file_hash": "blake3_hash_of_original_content"
+    "file_hash": "blake3_hash_of_original_content",
+    "type": "file"
+  }
+}
+```
+
+**Symbolic Links:**
+```json
+{
+  "symlink_target": "../target/file.txt",
+  "metadata": {
+    "path": "relative/path/to/symlink",
+    "size": 16,
+    "timestamp": 1749388804.3256009,
+    "file_hash": "blake3_hash_of_symlink_target",
+    "type": "symlink"
   }
 }
 ```
@@ -184,17 +241,33 @@ Original File → LZ4 Compress → ChaCha20-Poly1305 Encrypt → Base64 Encode �
 
 ## Key Design Decisions
 
-### Path-Aware Blob Creation
+### File Type Handling
 
-**Decision**: `file_id = BLAKE3(path:file_hash)` instead of `file_id = file_hash`
+**Regular Files:**
+- `file_id = BLAKE3(canonical_path:file_hash)` for unique content
+- Multiple paths can share same `file_id` (hardlink groups)
+- Full blob creation with ChaCha20-Poly1305 encryption
+
+**Hardlink Groups:**
+- Client provides `(path, st_dev, st_inode)` tuples
+- Group files by `(st_dev, st_inode)` to detect hardlinks
+- Pick canonical path (lexicographically first) for blob creation
+- All paths in group inherit same `file_id` from canonical path
+- Only canonical path (`is_canonical = TRUE`) gets uploaded
+- Massive deduplication for rsync --link-dest hardlink forests
+
+**Symbolic Links:**
+- `file_id = BLAKE3(path:target_hash)` where target_hash = BLAKE3(symlink_target)
+- `file_hash = BLAKE3(symlink_target)` instead of file content
+- Special blob with plaintext symlink target (no encryption needed)
+- `is_symlink = TRUE` in database
+- Perfect symlink recreation during disaster recovery
 
 **Benefits:**
-- **Disaster recovery without database**: Blobs contain complete path information
-- **Deterministic operations**: Same content at same path always produces same blob
-- **Simple resume logic**: Re-process files where `upload_finish_tm IS NULL`
-- **No reference counting**: Eliminates complex blob lifecycle management
-
-**Trade-off accepted**: Same content at different paths creates separate blobs (storage duplication for operational simplicity)
+- **Hardlink deduplication**: Hundreds of thousands of hardlinks → single blob
+- **Symlink preservation**: Maintains symlink semantics exactly
+- **Disaster recovery**: Complete recreation of file structure including hardlinks
+- **Path-aware design**: Same content at different paths still creates different blobs (unless hardlinked)
 
 ### Upload State Management
 
@@ -222,26 +295,39 @@ The dual timestamp approach provides clear state tracking:
 ### Upload Process
 
 1. **Changeset Creation**: `changeset_id = BLAKE3(name + sorted_file_list)`
-2. **File Processing**: For each file:
-   - Generate `file_hash = BLAKE3(file_content)`
-   - Generate `file_id = BLAKE3(path:file_hash)`  
-   - Create blob via tested workflow
+2. **File Discovery**: Client provides `[(path, st_dev, st_inode), ...]` tuples
+3. **Hardlink Group Processing**:
+   - Group files by `(st_dev, st_inode)`
+   - Pick canonical path (lexicographically first) for each group
+   - Generate `file_id = BLAKE3(canonical_path:file_hash)` for group
+   - All paths in group inherit same `file_id`
+4. **File Processing**: For each file:
+   - **Regular files**: `file_hash = BLAKE3(file_content)`
+   - **Symlinks**: `file_hash = BLAKE3(symlink_target)`
    - Insert file record with both timestamps as `NULL`
+   - Mark canonical path with `is_canonical = TRUE`
+5. **Upload Processing**: For each canonical file:
    - Update `upload_start_tm = NOW()`
-   - Upload blob to backend
-   - Update `upload_finish_tm = NOW()`
+   - Create and upload blob to backend
+   - Update `upload_finish_tm = NOW()` for entire hardlink group
 
 ### Resume/Retry Logic
 
 ```sql
--- Find files needing upload (never started or stuck)
-SELECT path, file_id FROM files WHERE upload_finish_tm IS NULL;
-
--- Find stuck uploads (started >1 hour ago, not finished)
+-- Find canonical files needing upload (only canonical paths get uploaded)
 SELECT path, file_id FROM files 
-WHERE upload_start_tm IS NOT NULL 
+WHERE is_canonical = TRUE AND upload_finish_tm IS NULL;
+
+-- Find stuck uploads (canonical files started >1 hour ago, not finished)
+SELECT path, file_id FROM files 
+WHERE is_canonical = TRUE
+  AND upload_start_tm IS NOT NULL 
   AND upload_finish_tm IS NULL
   AND upload_start_tm < datetime('now', '-1 hour');
+
+-- Mark entire hardlink group as completed
+UPDATE files SET upload_finish_tm = NOW() 
+WHERE file_id = ? AND changeset_id = ?;
 ```
 
 ### Multi-Process Concurrency
@@ -270,13 +356,20 @@ conn.execute("PRAGMA synchronous=NORMAL")   # Faster writes, still safe
 
 **From Blobs Only** (no database):
 1. List all blobs in backend storage
-2. Decrypt each blob to extract metadata
-3. Reconstruct filesystem using `metadata.path`
+2. Decrypt each blob to extract metadata and content
+3. **Regular files**: Write content to `metadata.path`
+4. **Symlinks**: Create symlink using `symlink_target`
+5. **Hardlinks**: Cannot be recreated without database (blobs only contain canonical path)
 
 **From Database Only** (no blobs):
 1. Query files table for all uploaded files
 2. Re-read original files and recreate blobs  
 3. Upload missing blobs to backend
+
+**Complete Recovery** (blobs + database):
+1. Restore files using blob content
+2. Recreate hardlink groups using database `(st_dev, st_inode)` information
+3. Perfect recreation of original filesystem structure
 
 ### Recovery Tools
 
@@ -292,57 +385,85 @@ Complete disaster recovery toolset with minimal dependencies:
 ## Data Flow
 
 ```
-Client Request → Frontend API → Service Manager → Database + Backend Providers
-                                     ↓              ↓           ↓
-                             Encryption/Hashing   Metadata   Encrypted Blobs
-                                     ↓
-                               SQLite Operations
+External Client → Library API → Service Manager → Database + Backend Providers
+                       ↓              ↓              ↓           ↓
+               CLI (dev/debug)  Encryption/Hashing   Metadata   Encrypted Blobs
+                       ↓              ↓                         
+                Display/Logging SQLAlchemy Operations
 ```
 
-## Frontend API Design
+## Code Structure
 
-### Storage Operations
-
-**push**: Store files in a new changeset
-```python
-push(
-    project: str,                    # "dsg", "zfs-backup", etc.
-    dataset: str,                    # "BB", "tank/home", etc. 
-    file_paths: List[str],           # Files to store
-    source_snapshot: str = None,     # ZFS snapshot, git commit, etc.
-    description: str = None,         # Human readable description
-    backends: List[str] = None       # Which backends to push to
-) -> str  # Returns changeset_id
+```
+src/n2s/
+├── cli/
+│   ├── __init__.py
+│   ├── main.py          # Typer app entry point
+│   ├── commands/
+│   │   ├── __init__.py
+│   │   ├── push.py      # push command
+│   │   ├── pull.py      # pull command
+│   │   └── status.py    # status/query commands
+│   └── display.py       # Console output formatting
+├── clients/
+│   ├── __init__.py
+│   ├── base.py          # Abstract base client (for internal testing)
+│   └── find_client.py   # Simple find-based client (for CLI)
+├── service/
+│   ├── __init__.py
+│   ├── manager.py       # Service manager (business logic)
+│   ├── database/
+│   │   ├── __init__.py
+│   │   ├── models.py    # SQLAlchemy models/tables
+│   │   ├── operations.py # Database operations
+│   │   └── migrations.py # Schema migrations
+│   └── blob.py          # Blob creation/encryption
+├── backends/
+│   ├── __init__.py
+│   ├── base.py          # Abstract backend interface
+│   └── ssh_backend.py   # SSH/SCP implementation
+├── config/
+│   ├── __init__.py
+│   └── settings.py      # TOML config loading
+└── logging/
+    ├── __init__.py
+    └── setup.py         # Loguru configuration
 ```
 
-**pull**: Restore files from storage
+## Library API Design
+
+### Primary Interface (for External Clients)
+
+**Storage Operations**:
 ```python
-pull(
-    project: str,
-    dataset: str,
+# Core library methods - used by external clients
+service.push_changeset(
+    name: str,                       # Human-readable changeset name
+    file_paths: List[str]            # Absolute paths to files
+) -> str                             # Returns changeset_id
+
+service.pull_changeset(
+    changeset_id: str,               # Changeset to restore
     target_path: str,                # Where to restore files
-    source_snapshot: str = "latest", # Specific snapshot or "latest"
-    files: List[str] = None,         # Specific files or None for full changeset
-    force: bool = False              # Overwrite existing files
+    files: List[str] = None          # Specific files or None for all
 )
+
+service.get_changeset_status(
+    changeset_id: str = None         # Specific changeset or None for all
+) -> dict                            # Upload status, file counts, etc.
 ```
 
-### Query Operations
+### CLI Interface (for Development/Debugging)
 
-**list_files**: Files in a specific changeset with upload status
-```python
-list_files(project: str, dataset: str, source_snapshot: str, pattern: str = None)
+**Commands**:
+```bash
+# Simple file-based interface
+n2s push file1.txt file2.txt --changeset-name "manual-backup"
+n2s pull --changeset-id abc123 --target-path /restore/here
+n2s status [--changeset-id abc123]
 ```
 
-**search_files**: Files matching pattern across changesets with upload status
-```python
-search_files(project: str, dataset: str, pattern: str, since: str = None, until: str = None)
-```
-
-**list_changesets**: Available snapshots/changesets
-```python
-list_changesets(project: str, dataset: str, since: str = None, until: str = None)
-```
+**Usage Pattern**: External clients import the library, CLI is for manual operations
 
 ## Benefits of This Approach
 

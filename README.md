@@ -62,12 +62,37 @@ For detailed technical documentation:
 
 ## Installation
 
+### Development Installation
+
 ```bash
 # Requires Python >= 3.13 and uv
 git clone git@github.com:HRDAG/n2s.git
 cd n2s
+uv venv
+source .venv/bin/activate
 uv pip install -e .
 ```
+
+### Verify Installation
+
+```bash
+n2s --help
+```
+
+### CLI Usage
+
+```bash
+# Store files in a changeset
+n2s push file1.txt file2.txt --changeset-name "daily-backup"
+
+# Restore files from storage  
+n2s pull --changeset-id abc123 --target-path /restore/here
+
+# Check upload status
+n2s status
+```
+
+**Note**: n2s is primarily a library for external clients. The CLI is provided for development and debugging.
 
 
 ## License
