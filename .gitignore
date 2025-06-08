@@ -98,3 +98,7 @@ logs/
 
 # uv
 .python-version
+
+# Go build artifacts  
+recovery/bin/
+recovery/go.sum
