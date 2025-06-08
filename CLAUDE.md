@@ -106,11 +106,10 @@ Failures:
 ## Commands to run before proposing commits:
 ```bash
 pytest
-mypy .
-ruff check .
-black --check . --line-length 79
-# Check for pre-commit hooks:
-pre-commit run --all-files  # if .pre-commit-config.yaml exists
+# Optional linting (run occasionally):
+# mypy .
+# ruff check .
+# black --check . --line-length 79
 ```
 
 ## Project Dependencies

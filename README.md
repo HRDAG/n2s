@@ -81,6 +81,36 @@ n2s --help
 
 ### CLI Usage
 
+<!--- CLI help output start --->
+```
+                                                                                
+ Usage: n2s [OPTIONS] COMMAND [ARGS]...                                         
+                                                                                
+ Storage coordination service with path-aware blob creation and disaster        
+ recovery                                                                       
+                                                                                
+                                                                                
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --verbose             -v            Enable verbose logging                   │
+│ --config              -c      TEXT  Path to config file [default: None]      │
+│ --install-completion                Install completion for the current       │
+│                                     shell.                                   │
+│ --show-completion                   Show completion for the current shell,   │
+│                                     to copy it or customize the              │
+│                                     installation.                            │
+│ --help                              Show this message and exit.              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Commands ───────────────────────────────────────────────────────────────────╮
+│ push     Store files in a new changeset                                      │
+│ pull     Restore files from storage                                          │
+│ status   Query changeset and upload status                                   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+```
+<!--- CLI help output end --->
+
+**Example Usage:**
 ```bash
 # Store files in a changeset
 n2s push file1.txt file2.txt --changeset-name "daily-backup"
