@@ -36,7 +36,7 @@ def get_filetype(file_content: bytes) -> str:
         return "unknown"
 
 
-def create_blob(file_path: str, output_dir: str = "/tmp") -> str:
+def create_blob(file_path: Path, output_dir: str = "/tmp") -> str:
     """
     Create blob from file: read → hash → compress → encode → JSON wrap → write.
 
@@ -80,7 +80,7 @@ def create_blob(file_path: str, output_dir: str = "/tmp") -> str:
     # Write to output_dir/blobid
     dest_path = Path(output_dir) / blobid
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-
+    
     with open(dest_path, 'w') as f:
         json.dump(blob_data, f, indent=2)
 
@@ -93,7 +93,9 @@ def main(
 ):
     """Create a blob from a file and return its blobid."""
 
-    blobid = create_blob(file_path, output)
+    full_path = Path(file_path)
+    assert full_path.exists()
+    blobid = create_blob(full_path, output)
     typer.echo(blobid)
 
 
