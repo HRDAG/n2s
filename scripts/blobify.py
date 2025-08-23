@@ -17,6 +17,7 @@
 # n2s/scripts/blobify.py
 
 import base64
+import io
 import json
 import lz4.frame
 import os
@@ -36,6 +37,10 @@ def get_filetype(file_content: bytes) -> str:
         return "unknown"
 
 
+# Configuration
+CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks for reading file (each becomes one LZ4 frame)
+
+
 def create_blob(file_path: Path, output_dir: str = "/tmp") -> str:
     """
     Create blob from file: read → hash → compress → encode → JSON wrap → write.
@@ -47,42 +52,69 @@ def create_blob(file_path: Path, output_dir: str = "/tmp") -> str:
     Returns:
         blobid (hex string)
     """
-    # Read file content
-    with open(file_path, 'rb') as f:
-        file_content = f.read()
-
-    # Generate blobid from content (pure deduplication)
-    blobid = blake3.blake3(file_content).hexdigest()
-
     # Get file stats
     stat = os.stat(file_path)
-
-    # Get file type from content
-    filetype = get_filetype(file_content)
-
-    # LZ4 compress content
-    compressed = lz4.frame.compress(file_content)
-
-    # Base64 encode compressed content
-    content_b64 = base64.b64encode(compressed).decode('ascii')
-
-    # Create JSON blob
-    blob_data = {
-        'content': content_b64,
-        'metadata': {
-            'size': stat.st_size,
-            'mtime': stat.st_mtime,
-            'filetype': filetype,
-            'encryption': False
-        }
-    }
-
-    # Write to output_dir/blobid
-    dest_path = Path(output_dir) / blobid
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(dest_path, 'w') as f:
-        json.dump(blob_data, f, indent=2)
+    # Single pass: hash, compress, and stream to temporary file
+    import tempfile
+    temp_fd, temp_path = tempfile.mkstemp(dir=output_dir, suffix='.tmp')
+    
+    try:
+        with os.fdopen(temp_fd, 'w') as out_file:
+            # Write JSON header with multi-frame content structure
+            out_file.write('{\n  "content": {\n    "encoding": "lz4-multiframe",\n    "frames": [\n')
+            
+            # Stream process file in single pass - each chunk becomes independent LZ4 frame
+            with open(file_path, 'rb') as f:
+                hasher = blake3.blake3()
+                first_chunk = True
+                filetype = "unknown"
+                frame_count = 0
+                
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                        
+                    # Use first chunk for magic detection
+                    if first_chunk:
+                        filetype = get_filetype(chunk)
+                        first_chunk = False
+                        
+                    # Update hash
+                    hasher.update(chunk)
+                    
+                    # Compress each chunk as independent LZ4 frame
+                    compressed_frame = lz4.frame.compress(chunk)
+                    
+                    # Base64 encode frame and write to JSON
+                    b64_frame = base64.b64encode(compressed_frame).decode('ascii')
+                    
+                    if frame_count > 0:
+                        out_file.write(',\n')
+                    out_file.write(f'      "{b64_frame}"')
+                    frame_count += 1
+                
+                # Generate blobid
+                blobid = hasher.hexdigest()
+            
+            # Write JSON footer
+            out_file.write('\n    ]\n  },\n  "metadata": {\n')
+            out_file.write(f'    "size": {stat.st_size},\n')
+            out_file.write(f'    "mtime": {stat.st_mtime},\n')
+            out_file.write(f'    "filetype": "{filetype}",\n')
+            out_file.write('    "encryption": false\n')
+            out_file.write('  }\n}')
+        
+        # Move temp file to final destination
+        dest_path = Path(output_dir) / blobid
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        Path(temp_path).rename(dest_path)
+        
+    except Exception:
+        # Clean up temp file on error
+        Path(temp_path).unlink(missing_ok=True)
+        raise
 
     return blobid
 

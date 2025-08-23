@@ -18,6 +18,7 @@
 # ------
 # n2s/scripts/pbnas_blob_worker.py
 
+from blobify import create_blob
 import os
 import subprocess
 import sys
@@ -30,7 +31,6 @@ from loguru import logger
 
 # Import our blobify function
 sys.path.append(str(Path(__file__).parent))
-from blobify import create_blob
 
 # Configuration
 # DB_HOST = "192.168.86.200"
@@ -48,14 +48,16 @@ def setup_logging():
     logger.add(
         sys.stdout,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
-        level="INFO"
+        level="INFO",
     )
 
 
 def get_db_connection():
     """Create database connection with timezone set."""
     # Try connection string format instead of parameters
-    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME} connect_timeout=10"
+    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={
+        DB_NAME
+    } connect_timeout=10"
     conn = psycopg2.connect(conn_string)
     # Set timezone for this session
     with conn.cursor() as cur:
@@ -101,7 +103,7 @@ def process_one_file(conn) -> bool:
             fs_pth = row[0]
             logger.info(f"Processing pth={fs_pth}")
 
-            if not ('dump-2019' in fs_pth or 'osxgather' in fs_pth):
+            if not ("dump-2019" in fs_pth or "osxgather" in fs_pth):
                 logger.warning(f"unmounted path {fs_pth}")
                 return False
 
@@ -130,24 +132,31 @@ def process_one_file(conn) -> bool:
 
             # Create remote directory first, then rsync
             try:
-                subprocess.run([
-                    "ssh", REMOTE_HOST, f"mkdir -p {REMOTE_BASE}/{AA}/{BB}"
-                ], check=True)
 
-                subprocess.run([
-                    "rsync", blob_path, remote_path
-                ], check=True)
+                subprocess.run(
+                    [
+                        "rsync",
+                        "-az",
+                        "-e ssh -p 2222",
+                        blob_path,
+                        remote_path,
+                    ],
+                    check=True,
+                )
             except subprocess.CalledProcessError as e:
                 logger.error(f"rsync command failed: {e}")
                 logger.error(f"Attempted: rsync {blob_path} {remote_path}")
                 raise
 
             # Update database
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE fs
                 SET blobid = %s, uploaded = NOW()
                 WHERE pth = %s
-            """, (blobid, fs_pth))
+            """,
+                (blobid, fs_pth),
+            )
 
             # Commit transaction (releases advisory lock)
             cur.execute("COMMIT")
