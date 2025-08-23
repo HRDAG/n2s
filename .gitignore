@@ -6,6 +6,10 @@
 # ------
 # .gitignore
 
+meta-CLAUDE.md
+CLAUDE.md
+tmp/
+
 # Python
 __pycache__/
 *.py[cod]
