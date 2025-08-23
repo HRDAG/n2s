@@ -85,6 +85,7 @@ def process_one_file(conn) -> bool:
                   FROM fs
                   WHERE main = true
                     AND blobid IS NULL
+                    AND last_missing_at IS NULL
                     AND tree IN ('osxgather', 'dump-2019')
                   LIMIT 2000  -- Only evaluate 1000 rows max
                 )
@@ -112,7 +113,15 @@ def process_one_file(conn) -> bool:
             # Check if file exists
             if not full_path.exists():
                 logger.warning(f"File not found: {full_path}")
-                cur.execute("ROLLBACK")
+                
+                # Mark file as missing with TZ-aware timestamp (uses session TZ)
+                cur.execute("""
+                    UPDATE fs 
+                    SET last_missing_at = NOW()
+                    WHERE pth = %s
+                """, (fs_pth,))
+                
+                cur.execute("COMMIT")  # Commit the missing file marker
                 return True  # Continue processing other files
 
             # Create blob in /tmp
@@ -178,10 +187,31 @@ def process_one_file(conn) -> bool:
         return True
 
 
+def ensure_schema():
+    """Ensure last_missing_at column exists."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Add column if it doesn't exist
+            cur.execute("""
+                ALTER TABLE fs ADD COLUMN IF NOT EXISTS 
+                last_missing_at TIMESTAMP WITH TIME ZONE
+            """)
+        conn.commit()
+        logger.info("Schema check complete")
+    except Exception as e:
+        logger.warning(f"Schema check failed (may already exist): {e}")
+    finally:
+        conn.close()
+
+
 def main():
     """Main worker loop."""
     setup_logging()
     logger.info("Starting pbnas_blob_worker")
+
+    # Ensure schema is up to date
+    ensure_schema()
 
     # Connect to database
     conn = get_db_connection()
