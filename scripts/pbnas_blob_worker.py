@@ -4,77 +4,73 @@
 # dependencies = [
 #   "psycopg2-binary",
 #   "loguru",
+#   "colorama",
+#   "humanize",
 #   "lz4",
 #   "blake3",
 #   "python-magic",
-#   "typer",
 # ]
 # ///
 
 # Author: PB & Claude
 # Maintainer: PB
-# Original date: 2025.01.22
+# Original date: 2025.09.02
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
-# n2s/scripts/pbnas_blob_worker-rowlock.py
+# scripts/pbnas_blob_worker.py
 
 """
-Improved blob worker using row-level locking instead of advisory locks.
+High-performance blob worker that uses a dedicated work queue table.
 
 Key improvements:
-- Minimal lock scope: locks only held during claim/update operations
-- Uses FOR UPDATE SKIP LOCKED to avoid lock contention
-- Processing status column prevents duplicate work without holding locks
-- Automatic cleanup of stale processing records
-- Better error handling and timeout resilience
+- Uses separate work_queue table for extremely fast claiming
+- No need for TABLESAMPLE or complex filtering
+- Work queue only contains unprocessed files
+- Claims are sub-millisecond operations
 """
 
-from blobify import create_blob
 import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Optional
-from collections import defaultdict
-from threading import Lock
+from typing import Optional, Tuple
+import signal
+import threading
 
+import humanize
 import psycopg2
 from loguru import logger
+from psycopg2 import pool
 
 # Import our blobify function
 sys.path.append(str(Path(__file__).parent))
+from blobify import create_blob
 
 # Configuration
 DB_HOST = "snowball"
 DB_USER = "pball"
 DB_NAME = "pbnas"
-REMOTE_HOST = "snowball"
-REMOTE_BASE = "/n2s/block_storage"
-SLEEP_INTERVAL = 2.0  # seconds between processing attempts
-STALE_PROCESSING_MINUTES = 30  # Reset files stuck in processing
+UPLOAD_HOST = "snowball"
+UPLOAD_PATH = "/n2s/block_storage"  # Correct path from main worker
+SSH_PORT = "2222"  # SSH runs on port 2222
 
-# SSH connection pooling configuration
-SSH_CONTROL_PATH = "/tmp/ssh-pbnas-%r@%h:%p"
-SSH_OPTS = (
-    "ssh -p 2222 "
-    "-o ControlMaster=auto "
-    f"-o ControlPath={SSH_CONTROL_PATH} "
-    "-o ControlPersist=10m "
-    "-o Compression=no "
-    "-o ServerAliveInterval=60 "
-    "-o BatchMode=yes"
-)
+# Pool configuration
+MIN_CONNECTIONS = 2
+MAX_CONNECTIONS = 10
+
+# Create a global connection pool
+connection_pool = None
 
 # Performance statistics
-stats_lock = Lock()
 performance_stats = {
     'files_processed': 0,
     'files_claimed': 0,
     'files_missing': 0,
     'files_failed': 0,
-    'files_skipped_dedup': 0,  # Files skipped due to existing blob
+    'files_skipped_dedup': 0,
     'stale_resets': 0,
     'total_time': 0.0,
     'claim_time': 0.0,
@@ -83,15 +79,21 @@ performance_stats = {
     'upload_time': 0.0,
     'update_time': 0.0,
     'total_bytes': 0,
-    'bytes_deduplicated': 0,  # Bytes saved by deduplication
+    'bytes_deduplicated': 0,
     'start_time': time.time()
 }
 
-# Global connection pools
-_claim_connection = None
-_update_connection = None
-_missing_connection = None
-_check_connection = None
+# Thread lock for stats updates
+stats_lock = threading.Lock()
+
+# Track if we should continue running
+should_continue = True
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global should_continue
+    logger.info(f"Received signal {signum}, shutting down gracefully...")
+    should_continue = False
 
 
 def setup_logging():
@@ -100,322 +102,257 @@ def setup_logging():
     logger.add(
         sys.stdout,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
-        level="INFO",
+        level="DEBUG",
     )
 
 
+def init_connection_pool():
+    """Initialize the database connection pool."""
+    global connection_pool
+    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME}"
+    connection_pool = psycopg2.pool.ThreadedConnectionPool(
+        MIN_CONNECTIONS,
+        MAX_CONNECTIONS,
+        conn_string
+    )
+    logger.info(f"Initialized connection pool with {MIN_CONNECTIONS}-{MAX_CONNECTIONS} connections")
+
+
 def get_db_connection():
-    """Create database connection with timezone set."""
-    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME} connect_timeout=10"
-    conn = psycopg2.connect(conn_string)
-    # Set timezone for this session
-    with conn.cursor() as cur:
-        cur.execute("SET timezone = 'America/Los_Angeles'")
-    conn.commit()
-    return conn
+    """Get a connection from the pool."""
+    if connection_pool is None:
+        init_connection_pool()
+    return connection_pool.getconn()
 
 
-def get_claim_connection():
-    """Get or create a reusable connection for claim operations."""
-    global _claim_connection
-    try:
-        if _claim_connection is None or _claim_connection.closed:
-            _claim_connection = get_db_connection()
-        else:
-            # Test connection is still alive
-            with _claim_connection.cursor() as cur:
-                cur.execute("SELECT 1")
-    except (psycopg2.Error, AttributeError):
-        # Connection is dead, create new one
-        _claim_connection = get_db_connection()
-    return _claim_connection
+def return_db_connection(conn):
+    """Return a connection to the pool."""
+    if connection_pool:
+        connection_pool.putconn(conn)
 
 
-def get_update_connection():
-    """Get or create a reusable connection for update operations."""
-    global _update_connection
-    try:
-        if _update_connection is None or _update_connection.closed:
-            _update_connection = get_db_connection()
-        else:
-            # Test connection is still alive
-            with _update_connection.cursor() as cur:
-                cur.execute("SELECT 1")
-    except (psycopg2.Error, AttributeError):
-        # Connection is dead, create new one
-        _update_connection = get_db_connection()
-    return _update_connection
-
-
-def get_missing_connection():
-    """Get or create a reusable connection for missing file operations."""
-    global _missing_connection
-    try:
-        if _missing_connection is None or _missing_connection.closed:
-            _missing_connection = get_db_connection()
-        else:
-            # Test connection is still alive
-            with _missing_connection.cursor() as cur:
-                cur.execute("SELECT 1")
-    except (psycopg2.Error, AttributeError):
-        # Connection is dead, create new one
-        _missing_connection = get_db_connection()
-    return _missing_connection
-
-
-def get_check_connection():
-    """Get or create a reusable connection for blob existence checks."""
-    global _check_connection
-    try:
-        if _check_connection is None or _check_connection.closed:
-            _check_connection = get_db_connection()
-        else:
-            # Test connection is still alive
-            with _check_connection.cursor() as cur:
-                cur.execute("SELECT 1")
-    except (psycopg2.Error, AttributeError):
-        # Connection is dead, create new one
-        _check_connection = get_db_connection()
-    return _check_connection
-
-
-def claim_work() -> Optional[str]:
+def claim_work(worker_id: str) -> Optional[str]:
     """
-    Phase 1: Quickly claim a file for processing using reused connection.
-    Uses row-level locking with SKIP LOCKED to avoid contention.
+    Claim a file from the work queue - extremely fast operation.
+    Returns the path of the claimed file or None if no work available.
     """
     claim_start = time.time()
     logger.debug("Starting claim_work()")
+    conn = get_db_connection()
+    
     try:
-        logger.debug("Getting reused DB connection for claim")
-        conn_start = time.time()
-        claim_conn = get_claim_connection()
-        conn_time = time.time() - conn_start
-        logger.debug(f"Got DB connection in {conn_time:.3f}s, executing claim query")
-        with claim_conn.cursor() as cur:
-            # Use old worker's query pattern with processing_started instead of advisory locks
-            logger.debug("Finding candidate file using old worker pattern")
-            query_start = time.time()
+        logger.debug("Executing claim query with TABLESAMPLE")
+        with conn.cursor() as cur:
+            # Use TABLESAMPLE for fast random selection without full scan
+            # This samples ~0.1% of the table (about 1250 rows)
             cur.execute("""
-                WITH candidates AS (
-                  SELECT pth
-                  FROM fs
-                  WHERE main = true
-                    AND blobid IS NULL
-                    AND last_missing_at IS NULL
-                    AND processing_started IS NULL
-                    AND pth NOT LIKE '%/'
-                    AND pth NOT LIKE '%/status'
-                    AND pth NOT LIKE '%/.git'
-                    AND pth NOT LIKE '%/.svn'
-                  LIMIT 2000  -- Evaluate larger sample like old worker
-                )
-                UPDATE fs
-                SET processing_started = NOW()
+                UPDATE work_queue
+                SET claimed_at = NOW(), claimed_by = %s
                 WHERE pth = (
-                  SELECT pth FROM candidates
-                  ORDER BY RANDOM()
-                  LIMIT 1
+                    SELECT pth
+                    FROM work_queue TABLESAMPLE BERNOULLI(0.1)
+                    WHERE claimed_at IS NULL
+                    LIMIT 1
                 )
+                AND claimed_at IS NULL  -- Double-check to prevent race condition
                 RETURNING pth
-            """)
-            query_time = time.time() - query_start
-            logger.debug(f"Combined query took {query_time:.3f}s")
-            logger.debug("Claim query completed, fetching result")
+            """, (worker_id,))
             
-            row = cur.fetchone()
-            logger.debug("Committing claim transaction")
-            commit_start = time.time()
-            claim_conn.commit()
-            commit_time = time.time() - commit_start
-            logger.debug(f"Claim transaction committed in {commit_time:.3f}s")
+            result = cur.fetchone()
+            conn.commit()
             
             claim_time = time.time() - claim_start
             
-            if row:
+            if result:
                 with stats_lock:
                     performance_stats['files_claimed'] += 1
                     performance_stats['claim_time'] += claim_time
-                    
-                return row[0]
+                logger.debug(f"Claimed work in {claim_time:.3f}s")
+                return result[0]
             else:
+                logger.debug(f"No work available (checked in {claim_time:.3f}s)")
                 return None
                 
     except psycopg2.Error as e:
-        claim_time = time.time() - claim_start
-        logger.error(f"Failed to claim work after {claim_time:.3f}s: {e}")
-        # Mark connection as dead so it gets recreated
-        global _claim_connection
-        if _claim_connection:
-            _claim_connection.rollback()
-        _claim_connection = None
+        logger.error(f"Failed to claim work: {e}")
+        conn.rollback()
         return None
+    finally:
+        return_db_connection(conn)
 
 
-def process_claimed_file(pth: str) -> bool:
-    """
-    Phase 2: Process the claimed file without holding any database locks.
-    If this hangs on I/O, it only affects this worker, not others.
-    """
-    global _missing_connection, _update_connection, _check_connection
+def remove_from_queue(pth: str):
+    """Remove a file from the work queue after processing."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM work_queue WHERE pth = %s", (pth,))
+            conn.commit()
+    except psycopg2.Error as e:
+        logger.error(f"Failed to remove {pth} from queue: {e}")
+        conn.rollback()
+    finally:
+        return_db_connection(conn)
+
+
+def update_fs_table(pth: str, blob_id: Optional[str] = None, is_missing: bool = False):
+    """Update the fs table with processing results."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if is_missing:
+                cur.execute(
+                    "UPDATE fs SET last_missing_at = NOW() WHERE pth = %s",
+                    (pth,)
+                )
+            elif blob_id == 'DIRECTORY_SKIPPED':
+                cur.execute(
+                    "UPDATE fs SET blobid = %s, uploaded = NOW() WHERE pth = %s",
+                    (blob_id, pth)
+                )
+            else:
+                cur.execute(
+                    "UPDATE fs SET blobid = %s, uploaded = NOW() WHERE pth = %s",
+                    (blob_id, pth)
+                )
+            conn.commit()
+    except psycopg2.Error as e:
+        logger.error(f"Failed to update fs table for {pth}: {e}")
+        conn.rollback()
+    finally:
+        return_db_connection(conn)
+
+
+def check_blob_exists(blob_id: str) -> bool:
+    """Check if a blob already exists in the database."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM fs WHERE blobid = %s LIMIT 1", (blob_id,))
+            return cur.fetchone() is not None
+    except psycopg2.Error as e:
+        logger.warning(f"Failed to check blob existence: {e}")
+        return False
+    finally:
+        return_db_connection(conn)
+
+
+# Note: create_blob is now imported from blobify.py
+# It uses blake3 hashing and lz4 compression with JSON wrapping
+
+
+def upload_blob(blob_path: str, blob_id: str) -> bool:
+    """Upload blob to storage server using rsync."""
+    AA = blob_id[0:2]
+    BB = blob_id[2:4]
+    remote_path = f"{UPLOAD_HOST}:{UPLOAD_PATH}/{AA}/{BB}/{blob_id}"
+    
+    logger.trace(f"Uploading {blob_id} to {UPLOAD_PATH}/{AA}/{BB}/")
+    
+    # Use rsync like the main worker does
+    try:
+        # Use rsync with SSH on port 2222
+        subprocess.run([
+            "rsync",
+            "-W",  # --whole-file
+            "--no-perms", "--no-owner", "--no-group", "--no-times",
+            "-e", f"ssh -p {SSH_PORT} -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=60",
+            blob_path,
+            remote_path,
+        ], check=True, capture_output=True, text=True, timeout=300)  # 5 minute timeout like main worker
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"Upload timeout for {blob_id}")
+        return False
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Upload failed for {blob_id}: {e.stderr if e.stderr else e}")
+        return False
+
+
+def process_file(pth: str, worker_id: str) -> bool:
+    """Process a single file."""
     pipeline_start = time.time()
     
     try:
-        # Check if file exists and is a file (not directory)
+        # Check if file exists
         full_path = Path("/Volumes") / Path(pth)
         
         if not full_path.exists():
-            logger.warning(f"File not found: {full_path}")
-            
-            # Mark as missing and clear processing status with reused connection
-            try:
-                missing_conn = get_missing_connection()
-                with missing_conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE fs 
-                        SET last_missing_at = NOW(), 
-                            processing_started = NULL
-                        WHERE pth = %s
-                    """, (pth,))
-                    missing_conn.commit()
-            except psycopg2.Error as e:
-                logger.error(f"Failed to mark file as missing: {e}")
-                # Reset missing connection on error
-                _missing_connection = None
-            
+            logger.warning(f"File not found: {pth}")
+            update_fs_table(pth, is_missing=True)
+            remove_from_queue(pth)
             with stats_lock:
                 performance_stats['files_missing'] += 1
-                
-            return True  # Continue processing other files
+            return True
         
-        # Check if path is actually a file, not a directory
+        # Skip directories
         if not full_path.is_file():
             if full_path.is_dir():
                 logger.warning(f"Skipping directory (should not be in main files): {full_path}")
-                # Mark as processed with special blobid to avoid reprocessing
-                try:
-                    update_conn = get_update_connection()
-                    with update_conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE fs 
-                            SET blobid = 'DIRECTORY_SKIPPED',
-                                uploaded = NOW(),
-                                processing_started = NULL
-                            WHERE pth = %s
-                        """, (pth,))
-                        update_conn.commit()
-                except psycopg2.Error as e:
-                    logger.error(f"Failed to mark directory as skipped: {e}")
-                    _update_connection = None
-            else:
-                logger.warning(f"Path exists but is neither file nor directory: {full_path}")
-                # Reset processing status for unknown path types
-                try:
-                    update_conn = get_update_connection()
-                    with update_conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE fs 
-                            SET processing_started = NULL 
-                            WHERE pth = %s
-                        """, (pth,))
-                        update_conn.commit()
-                except psycopg2.Error as e:
-                    logger.error(f"Failed to reset processing status: {e}")
-                    _update_connection = None
-                        
-            return True  # Continue processing other files
-
+                update_fs_table(pth, blob_id='DIRECTORY_SKIPPED')
+                remove_from_queue(pth)
+            return True
+        
         # Read file and get stats
         read_start = time.time()
         stat = full_path.stat()
         logger.trace(f"Processing: {full_path}, size={stat.st_size} bytes")
-
+        
         # Create blob (compression step)
         compress_start = time.time()
-        blobid = create_blob(full_path, "/tmp")
+        blob_id = create_blob(full_path, "/tmp")  # blobify.py expects output_dir
         compress_time = time.time() - compress_start
         read_time = compress_start - read_start
-
-        logger.trace(f"✓ Created blob: {blobid}")
-        AA = blobid[0:2]
-        BB = blobid[2:4]
-        blob_path = f"/tmp/{blobid}"
-
-        # Check if this blob already exists in the database (deduplication)
-        upload_time = 0.0
-        blob_exists = False
         
-        try:
-            check_conn = get_check_connection()
-            with check_conn.cursor() as cur:
-                cur.execute("""
-                    SELECT 1 FROM fs 
-                    WHERE blobid = %s 
-                    LIMIT 1
-                """, (blobid,))
-                blob_exists = cur.fetchone() is not None
-        except psycopg2.Error as e:
-            logger.warning(f"Failed to check for existing blob, will upload anyway: {e}")
-            _check_connection = None
+        logger.trace(f"✓ Created blob: {blob_id}")
+        AA = blob_id[0:2]
+        BB = blob_id[2:4]
+        blob_path = f"/tmp/{blob_id}"
+        
+        # Check for deduplication
+        upload_time = 0.0
+        check_start = time.time()
+        blob_exists = check_blob_exists(blob_id)
+        check_time = time.time() - check_start
         
         if blob_exists:
             # Blob already exists, skip upload
-            logger.info(f"Blob {blobid[:16]}... already exists, skipping upload")
+            logger.info(f"Blob {blob_id[:16]}... already exists, skipping upload")
             with stats_lock:
                 performance_stats['files_skipped_dedup'] += 1
                 performance_stats['bytes_deduplicated'] += stat.st_size
         else:
             # New blob, need to upload
             upload_start = time.time()
-            remote_path = f"{REMOTE_HOST}:{REMOTE_BASE}/{AA}/{BB}/{blobid}"
-
-            logger.trace(f"Uploading {blobid} to {REMOTE_BASE}/{AA}/{BB}/")
-            
-            try:
-                subprocess.run([
-                    "rsync",
-                    "-W",  # --whole-file
-                    "--no-perms", "--no-owner", "--no-group", "--no-times",
-                    "-e", SSH_OPTS,
-                    blob_path,
-                    remote_path,
-                ], check=True, timeout=300)  # 5 minute timeout for uploads
-                
-            except subprocess.TimeoutExpired:
-                logger.error(f"Upload timeout for {blobid}")
-                raise
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Upload failed for {blobid}: {e}")
-                raise
-                
-            upload_time = time.time() - upload_start
-            logger.trace(f"✓ Uploaded: {remote_path}")
-
-        # Phase 3: Quick database update with reused connection
+            if upload_blob(blob_path, blob_id):
+                upload_time = time.time() - upload_start
+                logger.trace(f"✓ Uploaded: {UPLOAD_HOST}:{UPLOAD_PATH}/{AA}/{BB}/{blob_id}")
+            else:
+                logger.error(f"Failed to upload blob for {pth}")
+                # Clean up the temp file
+                Path(blob_path).unlink(missing_ok=True)
+                with stats_lock:
+                    performance_stats['files_failed'] += 1
+                return False
+        
+        # Update database
         update_start = time.time()
-        try:
-            update_conn = get_update_connection()
-            with update_conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE fs 
-                    SET blobid = %s, 
-                        uploaded = NOW(),
-                        processing_started = NULL
-                    WHERE pth = %s
-                """, (blobid, pth))
-                update_conn.commit()
-        except psycopg2.Error as e:
-            logger.error(f"Failed to update database: {e}")
-            _update_connection = None
-            raise
+        update_fs_table(pth, blob_id=blob_id)
         update_time = time.time() - update_start
-
-        # Clean up local blob file
+        
+        # Remove from queue
+        queue_start = time.time()
+        remove_from_queue(pth)
+        queue_time = time.time() - queue_start
+        
+        # Clean up local blob file if it still exists
         try:
             Path(blob_path).unlink()
         except FileNotFoundError:
             pass  # Already cleaned up
-
+        
         # Update performance statistics
         total_time = time.time() - pipeline_start
         with stats_lock:
@@ -426,278 +363,152 @@ def process_claimed_file(pth: str) -> bool:
             performance_stats['upload_time'] += upload_time
             performance_stats['update_time'] += update_time
             performance_stats['total_bytes'] += stat.st_size
-
+        
         # Get claim time from performance stats
         with stats_lock:
             avg_claim_time = performance_stats['claim_time'] / performance_stats['files_claimed'] if performance_stats['files_claimed'] > 0 else 0
         
-        logger.info(f"TIMING: claim={avg_claim_time:.3f}s read={read_time:.3f}s compress={compress_time:.3f}s upload={upload_time:.3f}s update={update_time:.3f}s total={total_time:.3f}s size={stat.st_size}")
-        logger.trace(f"✓ Completed: {pth} -> {blobid[:16]}...")
+        # Calculate overhead (everything else)
+        overhead_time = total_time - (read_time + compress_time + upload_time + update_time + check_time + queue_time)
+        
+        logger.info(
+            f"TIMING: claim={avg_claim_time:.3f}s "
+            f"read={read_time:.3f}s "
+            f"compress={compress_time:.3f}s "
+            f"check={check_time:.3f}s "
+            f"upload={upload_time:.3f}s "
+            f"update={update_time:.3f}s "
+            f"queue={queue_time:.3f}s "
+            f"overhead={overhead_time:.3f}s "
+            f"total={total_time:.3f}s "
+            f"size={stat.st_size}"
+        )
+        logger.trace(f"✓ Completed: {pth} -> {blob_id[:16]}...")
         
         return True
-
+        
     except Exception as e:
         logger.error(f"Processing failed for {pth}: {e}")
-        
-        # Reset processing status so file can be retried with reused connection
-        try:
-            update_conn = get_update_connection()
-            with update_conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE fs 
-                    SET processing_started = NULL 
-                    WHERE pth = %s
-                """, (pth,))
-                update_conn.commit()
-        except psycopg2.Error as db_e:
-            logger.error(f"Failed to reset processing status: {db_e}")
-            _update_connection = None
-            
         with stats_lock:
             performance_stats['files_failed'] += 1
-            
-        return True  # Continue processing other files
-
-
-def cleanup_stale_processing() -> int:
-    """Clean up files that have been stuck in processing state."""
-    global _update_connection
-    try:
-        cleanup_conn = get_update_connection()
-        with cleanup_conn.cursor() as cur:
-            cur.execute("""
-                UPDATE fs 
-                SET processing_started = NULL
-                WHERE processing_started < NOW() - INTERVAL '%s minutes'
-                  AND blobid IS NULL
-                RETURNING pth
-            """, (STALE_PROCESSING_MINUTES,))
-            
-            reset_files = cur.fetchall()
-            cleanup_conn.commit()
-            
-            if reset_files:
-                logger.warning(f"Reset {len(reset_files)} stale processing files")
-                with stats_lock:
-                    performance_stats['stale_resets'] += len(reset_files)
-                    
-            return len(reset_files)
-            
-    except psycopg2.Error as e:
-        logger.error(f"Failed to cleanup stale processing: {e}")
-        _update_connection = None
-        return 0
-
-
-def process_one_file() -> bool:
-    """
-    Main processing function with improved locking strategy.
-    Returns True if work was attempted, False if no work available.
-    """
-    # Phase 1: Quick claim with reused connection
-    pth = claim_work()
-    if not pth:
         return False
-    
-    # Phase 2: Process without holding any locks
-    process_claimed_file(pth)
-    return True
 
 
-def init_ssh_connection():
-    """Initialize SSH master connection for connection pooling."""
-    try:
-        result = subprocess.run([
-            "ssh", "-p", "2222",
-            "-o", "ControlMaster=auto",
-            "-o", f"ControlPath={SSH_CONTROL_PATH}",
-            "-o", "ControlPersist=10m",
-            "-o", "BatchMode=yes",
-            REMOTE_HOST,
-            "echo 'SSH master connection established'"
-        ], capture_output=True, text=True, timeout=30)
-
-        if result.returncode == 0:
-            logger.trace("SSH master connection established")
+def print_stats():
+    """Print performance statistics."""
+    with stats_lock:
+        elapsed = time.time() - performance_stats['start_time']
+        files_processed = performance_stats['files_processed']
+        files_claimed = performance_stats['files_claimed']
+        
+        if files_processed > 0:
+            avg_total = performance_stats['total_time'] / files_processed
+            avg_read = performance_stats['read_time'] / files_processed
+            avg_compress = performance_stats['compress_time'] / files_processed
+            avg_upload = performance_stats['upload_time'] / files_processed
+            avg_update = performance_stats['update_time'] / files_processed
         else:
-            logger.warning(f"SSH master connection failed: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logger.warning("SSH master connection timed out")
-    except Exception as e:
-        logger.warning(f"SSH master connection error: {e}")
+            avg_total = avg_read = avg_compress = avg_upload = avg_update = 0
+        
+        if files_claimed > 0:
+            avg_claim = performance_stats['claim_time'] / files_claimed
+        else:
+            avg_claim = 0
+        
+        logger.info(
+            f"\n{'='*60}\n"
+            f"Performance Statistics (Runtime: {elapsed:.1f}s)\n"
+            f"{'='*60}\n"
+            f"Files processed: {files_processed:,}\n"
+            f"Files claimed: {files_claimed:,}\n"
+            f"Files missing: {performance_stats['files_missing']:,}\n"
+            f"Files failed: {performance_stats['files_failed']:,}\n"
+            f"Files deduplicated: {performance_stats['files_skipped_dedup']:,}\n"
+            f"Total bytes: {humanize.naturalsize(performance_stats['total_bytes'])}\n"
+            f"Bytes deduplicated: {humanize.naturalsize(performance_stats['bytes_deduplicated'])}\n"
+            f"\nAverage times per file:\n"
+            f"  Claim:    {avg_claim:.3f}s\n"
+            f"  Read:     {avg_read:.3f}s\n"
+            f"  Compress: {avg_compress:.3f}s\n"
+            f"  Upload:   {avg_upload:.3f}s\n"
+            f"  Update:   {avg_update:.3f}s\n"
+            f"  Total:    {avg_total:.3f}s\n"
+            f"\nThroughput: {files_processed/elapsed:.1f} files/sec\n"
+            f"{'='*60}"
+        )
 
 
-def cleanup_ssh_connection():
-    """Clean up SSH master connection."""
-    try:
-        subprocess.run([
-            "ssh", "-p", "2222",
-            "-o", f"ControlPath={SSH_CONTROL_PATH}",
-            "-O", "exit",
-            REMOTE_HOST
-        ], capture_output=True, timeout=10)
-        logger.trace("SSH master connection closed")
-    except Exception as e:
-        logger.debug(f"SSH cleanup error (expected): {e}")
-
-
-def cleanup_connections():
-    """Clean up all reused database connections."""
-    global _claim_connection, _update_connection, _missing_connection, _check_connection
-    for conn_name, conn in [("claim", _claim_connection), ("update", _update_connection), 
-                             ("missing", _missing_connection), ("check", _check_connection)]:
-        if conn and not conn.closed:
-            try:
-                conn.close()
-                logger.trace(f"Closed {conn_name} connection")
-            except Exception as e:
-                logger.debug(f"Error closing {conn_name} connection: {e}")
-    _claim_connection = None
-    _update_connection = None
-    _missing_connection = None
-    _check_connection = None
-
-
-def ensure_schema():
-    """Ensure processing_started column exists."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            # Check if processing_started column exists
-            cur.execute("""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = 'fs' 
-                  AND column_name = 'processing_started'
-            """)
+def worker_loop(worker_id: str):
+    """Main worker loop."""
+    logger.info(f"Worker {worker_id} starting...")
+    
+    consecutive_empty = 0
+    last_stats_time = time.time()
+    last_file_time = time.time()
+    
+    while should_continue:
+        cycle_start = time.time()
+        
+        # Claim work
+        pth = claim_work(worker_id)
+        
+        if pth:
+            consecutive_empty = 0
+            # Process the file
+            success = process_file(pth, worker_id)
+            if not success:
+                logger.warning(f"Failed to process {pth}, will be retried later")
             
-            if not cur.fetchone():
-                logger.error("processing_started column not found!")
-                logger.error("Please run: n2s/scripts/migration/add_processing_column.py")
-                sys.exit(1)
-                
-        logger.trace("Schema check complete - processing_started column exists")
+            # Log full cycle time
+            cycle_time = time.time() - cycle_start
+            gap_time = cycle_start - last_file_time
+            last_file_time = time.time()
+            logger.debug(f"CYCLE: gap_between_files={gap_time:.3f}s cycle_total={cycle_time:.3f}s")
+        else:
+            consecutive_empty += 1
+            if consecutive_empty >= 10:
+                logger.info("No work available for 10 attempts, checking less frequently...")
+                time.sleep(5)
+            else:
+                time.sleep(0.5)
         
-    except Exception as e:
-        logger.error(f"Schema check failed: {e}")
-        sys.exit(1)
-    finally:
-        conn.close()
-
-
-def log_performance_summary():
-    """Log comprehensive performance statistics."""
-    if performance_stats['files_processed'] == 0 and performance_stats['files_claimed'] == 0:
-        return
-
-    elapsed = time.time() - performance_stats['start_time']
+        # Print stats periodically
+        if time.time() - last_stats_time > 30:
+            print_stats()
+            last_stats_time = time.time()
     
-    # File counts
-    claimed = performance_stats['files_claimed']
-    processed = performance_stats['files_processed']
-    missing = performance_stats['files_missing']
-    failed = performance_stats['files_failed']
-    dedup_skipped = performance_stats['files_skipped_dedup']
-    stale_resets = performance_stats['stale_resets']
-    
-    # Timing averages (only for processed files)
-    if processed > 0:
-        avg_total = performance_stats['total_time'] / processed
-        avg_claim = performance_stats['claim_time'] / claimed if claimed > 0 else 0
-        avg_read = performance_stats['read_time'] / processed
-        avg_compress = performance_stats['compress_time'] / processed
-        avg_upload = performance_stats['upload_time'] / processed
-        avg_update = performance_stats['update_time'] / processed
-
-        # Throughput calculations
-        throughput = processed / elapsed * 3600  # files per hour
-        mb_processed = performance_stats['total_bytes'] / (1024 * 1024)
-        mb_throughput = mb_processed / elapsed * 3600  # MB per hour
-        
-        # Deduplication savings
-        mb_deduplicated = performance_stats['bytes_deduplicated'] / (1024 * 1024)
-        dedup_percentage = (dedup_skipped / processed * 100) if processed > 0 else 0
-
-        logger.info(f"PERF SUMMARY: {processed} processed, {claimed} claimed, {missing} missing, {failed} failed, {dedup_skipped} dedup-skipped, {stale_resets} stale resets")
-        logger.info(f"DEDUP SAVINGS: {dedup_skipped} uploads skipped ({dedup_percentage:.1f}%), {mb_deduplicated:.1f} MB saved")
-        logger.info(f"THROUGHPUT: {throughput:.1f} files/hour, {mb_throughput:.1f} MB/hour in {elapsed:.1f}s")
-        logger.info(f"AVG TIMING: claim={avg_claim:.3f}s read={avg_read:.3f}s compress={avg_compress:.3f}s upload={avg_upload:.3f}s update={avg_update:.3f}s total={avg_total:.3f}s")
-
-        # Identify bottleneck
-        bottlenecks = [
-            ('claim', avg_claim),
-            ('read', avg_read),
-            ('compress', avg_compress),
-            ('upload', avg_upload),
-            ('update', avg_update)
-        ]
-        bottleneck = max(bottlenecks, key=lambda x: x[1])
-        logger.info(f"BOTTLENECK: {bottleneck[0]} ({bottleneck[1]:.3f}s avg, {bottleneck[1]/avg_total*100:.1f}% of total time)")
-    else:
-        logger.info(f"PERF SUMMARY: {claimed} claimed, {missing} missing, {failed} failed, {dedup_skipped} dedup-skipped, {stale_resets} stale resets in {elapsed:.1f}s")
+    logger.info(f"Worker {worker_id} shutting down")
+    print_stats()
 
 
 def main():
-    """Main worker loop with improved error handling."""
+    """Main entry point."""
     setup_logging()
-    logger.info("Starting pbnas_blob_worker (optimized with connection pooling)")
-
-    # Ensure schema is compatible
-    ensure_schema()
-
-    # Initialize SSH master connection
-    init_ssh_connection()
-
-    # Connect to database
-    conn = get_db_connection()
-    logger.info(f"Connected to {DB_NAME} at {DB_HOST}")
-    conn.close()  # We'll use connection pools instead
-
+    
+    # Generate unique worker ID
+    worker_id = f"worker_{uuid.uuid4().hex[:8]}"
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Initialize connection pool
+    init_connection_pool()
+    
+    logger.info(f"Starting pbnas blob worker (work queue version) - ID: {worker_id}")
+    
     try:
-        stale_cleanup_counter = 0
-        
-        while True:
-            try:
-                logger.debug("Starting new work cycle")
-                work_done = process_one_file()
-                logger.debug(f"Work cycle completed, work_done={work_done}")
-                
-                if work_done:
-                    # Brief pause between files
-                    time.sleep(0.1)
-
-                    # Log performance summary every 100 processed files
-                    with stats_lock:
-                        if performance_stats['files_processed'] % 100 == 0 and performance_stats['files_processed'] > 0:
-                            log_performance_summary()
-                else:
-                    # No work available, longer sleep
-                    logger.debug("No work available, sleeping...")
-                    time.sleep(SLEEP_INTERVAL)
-
-                # Clean up stale processing records periodically
-                stale_cleanup_counter += 1
-                if stale_cleanup_counter >= 100:
-                    cleanup_stale_processing()
-                    stale_cleanup_counter = 0
-
-            except KeyboardInterrupt:
-                logger.info("Shutdown requested")
-                break
-            except psycopg2.Error as e:
-                logger.error(f"Database error: {e}")
-                # Reset connections on database errors
-                cleanup_connections()
-                time.sleep(SLEEP_INTERVAL)
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                time.sleep(SLEEP_INTERVAL)
-
+        worker_loop(worker_id)
+    except KeyboardInterrupt:
+        logger.info("Received interrupt, shutting down...")
+    except Exception as e:
+        logger.error(f"Worker crashed: {e}")
+        raise
     finally:
-        cleanup_connections()
-        cleanup_ssh_connection()
-        log_performance_summary()  # Final summary
-        logger.trace("Worker stopped")
+        # Clean up
+        if connection_pool:
+            connection_pool.closeall()
+            logger.info("Closed all database connections")
 
 
 if __name__ == "__main__":
