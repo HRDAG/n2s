@@ -20,13 +20,13 @@
 Database cleanup for bad blobs.
 Reads bad-blobids file and updates database accordingly.
 
-Input file format: {blobid} {uploaded} {pth}
+Input file format: {type} | {blobid} | {uploaded} | {path}
 """
 
 import sys
 import psycopg2
 from datetime import datetime
-from typing import List, Tuple
+from typing import List
 import argparse
 from loguru import logger
 import humanize
@@ -48,33 +48,49 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def read_bad_blobs(filename: str) -> List[Tuple[str, str, str]]:
+def read_bad_blobids(filename: str) -> List[str]:
     """
-    Read bad blobs from file.
-    Format: {blobid} {uploaded} {pth}
+    Read bad blob IDs from file.
+    Format: {type} | {blobid} | {uploaded} | {path}
+    We only need the blobid - paths will be looked up from database.
     """
-    bad_blobs = []
+    blobids = []
     with open(filename, 'r') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith('#') or line.startswith('-'):
                 continue
-            parts = line.split(' ', 2)
-            if len(parts) == 3:
-                blobid, uploaded, pth = parts
-                bad_blobs.append((blobid, uploaded, pth))
+            
+            # Parse pipe-delimited format
+            parts = line.split(' | ')
+            if len(parts) == 4:  # type | blobid | uploaded | path
+                blobid = parts[1]
+                blobids.append(blobid)
             else:
                 logger.warning(f"Line {line_num}: Skipping malformed line: {line}")
-    return bad_blobs
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_blobids = []
+    for blobid in blobids:
+        if blobid not in seen:
+            seen.add(blobid)
+            unique_blobids.append(blobid)
+    
+    logger.info(f"Read {len(blobids)} blob entries, {len(unique_blobids)} unique blobids")
+    return unique_blobids
 
 
-def cleanup_database(bad_blobs: List[Tuple[str, str, str]], batch_size: int = 1000, dry_run: bool = False):
+def cleanup_database(bad_blobids: List[str], batch_size: int = 100, dry_run: bool = False):
     """
-    Clean up database:
-    1. Set blobid=NULL for bad blobs
-    2. Add paths back to work_queue
+    Clean up database by blobid:
+    1. Find all paths with each blobid
+    2. Set blobid=NULL, uploaded=NULL for those records
+    3. Add paths back to work_queue
+    
+    Note: One blobid can have multiple paths (deduplication)
     """
-    if not bad_blobs:
+    if not bad_blobids:
         logger.info("No bad blobs to process")
         return
     
@@ -90,45 +106,57 @@ def cleanup_database(bad_blobs: List[Tuple[str, str, str]], batch_size: int = 10
     try:
         cur = conn.cursor()
         
-        logger.info(f"Processing {len(bad_blobs):,} bad blobs in batches of {batch_size}...")
+        logger.info(f"Processing {len(bad_blobids):,} unique bad blobids in batches of {batch_size}...")
         
         total_updated = 0
         total_queued = 0
+        total_paths_affected = 0
         
         # Process in batches for efficiency
-        for i in range(0, len(bad_blobs), batch_size):
-            batch = bad_blobs[i:i+batch_size]
+        for i in range(0, len(bad_blobids), batch_size):
+            batch = bad_blobids[i:i+batch_size]
             batch_num = i//batch_size + 1
-            total_batches = (len(bad_blobs) + batch_size - 1) // batch_size
+            total_batches = (len(bad_blobids) + batch_size - 1) // batch_size
             
-            logger.info(f"Processing batch {batch_num}/{total_batches} (items {i+1}-{min(i+batch_size, len(bad_blobs))})")
+            logger.info(f"Processing batch {batch_num}/{total_batches} (blobids {i+1}-{min(i+batch_size, len(bad_blobids))})")
             
             # Start transaction for this batch
             cur.execute("BEGIN")
             
             try:
-                # Clear blobids for this batch
-                update_count = 0
-                for blobid, uploaded, pth in batch:
-                    # Escape single quotes in path
-                    safe_pth = pth.replace("'", "''")
-                    cur.execute(f"""
-                        UPDATE fs 
-                        SET blobid = NULL, uploaded = NULL 
-                        WHERE pth = '{safe_pth}' AND blobid = '{blobid}'
-                    """)
-                    update_count += cur.rowcount
+                batch_paths = []
+                batch_updated = 0
                 
-                # Add paths back to work_queue
-                paths_to_queue = [pth for _, _, pth in batch]
-                if paths_to_queue:
-                    # Build the VALUES clause
-                    values_clause = ','.join([f"('{pth.replace(\"'\", \"''\")}', NOW())" for _, _, pth in batch])
-                    cur.execute(f"""
-                        INSERT INTO work_queue (pth, added_at)
-                        VALUES {values_clause}
+                for blobid in batch:
+                    # First, get all paths that have this blobid
+                    cur.execute("""
+                        SELECT pth FROM fs WHERE blobid = %s
+                    """, (blobid,))
+                    paths = [row[0] for row in cur.fetchall()]
+                    
+                    if paths:
+                        batch_paths.extend(paths)
+                        
+                        # Update all records with this blobid
+                        cur.execute("""
+                            UPDATE fs 
+                            SET blobid = NULL, uploaded = NULL 
+                            WHERE blobid = %s
+                        """, (blobid,))
+                        batch_updated += cur.rowcount
+                        
+                        if cur.rowcount > 1:
+                            logger.debug(f"  Blobid {blobid[:16]}... found in {cur.rowcount} records (deduplication)")
+                
+                # Add all affected paths to work_queue
+                if batch_paths:
+                    # Use unnest to insert multiple values efficiently
+                    cur.execute("""
+                        INSERT INTO work_queue (pth, created_at)
+                        SELECT DISTINCT pth, NOW() 
+                        FROM unnest(%s::text[]) AS pth
                         ON CONFLICT (pth) DO NOTHING
-                    """)
+                    """, (batch_paths,))
                     queue_count = cur.rowcount
                 else:
                     queue_count = 0
@@ -136,10 +164,11 @@ def cleanup_database(bad_blobs: List[Tuple[str, str, str]], batch_size: int = 10
                 # Commit this batch
                 cur.execute("COMMIT")
                 
-                total_updated += update_count
+                total_updated += batch_updated
                 total_queued += queue_count
+                total_paths_affected += len(batch_paths)
                 
-                logger.debug(f"  Batch {batch_num}: Updated {update_count} records, added {queue_count} to work_queue")
+                logger.debug(f"  Batch {batch_num}: Updated {batch_updated} records, added {queue_count} to work_queue")
                 
             except Exception as e:
                 cur.execute("ROLLBACK")
@@ -157,104 +186,20 @@ def cleanup_database(bad_blobs: List[Tuple[str, str, str]], batch_size: int = 10
         """)
         queue_count = cur.fetchone()[0]
         
-        # Get total size to reprocess
-        paths = [pth for _, _, pth in bad_blobs]
-        format_strings = ','.join(['%s'] * len(paths))
-        cur.execute(f"""
-            SELECT SUM(stat_size) 
-            FROM fs 
-            WHERE pth IN ({format_strings})
-        """, paths)
-        total_size = cur.fetchone()[0] or 0
-        
         logger.info("\n" + "="*60)
         logger.info("DATABASE CLEANUP COMPLETE")
         logger.info("="*60)
-        logger.info(f"Total bad blobs processed: {len(bad_blobs):,}")
-        logger.info(f"Database records updated: {total_updated:,}")
+        logger.info(f"Unique bad blobids processed: {len(bad_blobids):,}")
+        logger.info(f"Total database records updated: {total_updated:,}")
+        logger.info(f"Total paths affected: {total_paths_affected:,}")
         logger.info(f"Items added to work_queue: {total_queued:,}")
-        logger.info(f"Total size to reprocess: {humanize.naturalsize(total_size)}")
+        logger.info(f"Deduplication factor: {total_updated / len(bad_blobids):.2f} paths per blobid")
         logger.info(f"Current NULL blobids in fs table: {null_count:,}")
         logger.info(f"Current items in work_queue: {queue_count:,}")
         
     finally:
         conn.close()
 
-
-def generate_sql_script(bad_blobs: List[Tuple[str, str, str]], output_file: str = "fix_bad_blobs.sql"):
-    """
-    Generate SQL script for manual review/execution if preferred.
-    """
-    logger.info(f"Generating SQL script: {output_file}")
-    
-    with open(output_file, 'w') as f:
-        f.write("-- SQL to fix incorrectly processed blobs\n")
-        f.write(f"-- Generated: {datetime.now()}\n")
-        f.write(f"-- Total bad blobs: {len(bad_blobs)}\n\n")
-        
-        f.write("\\timing on\n\n")
-        f.write("BEGIN;\n\n")
-        
-        # Clear blobids for bad blobs
-        f.write("-- Clear bad blobids\n")
-        for blobid, uploaded, pth in bad_blobs:
-            safe_pth = pth.replace("'", "''")
-            f.write(f"UPDATE fs SET blobid = NULL, uploaded = NULL WHERE pth = '{safe_pth}' AND blobid = '{blobid}';\n")
-        
-        f.write("\n-- Add files back to work queue\n")
-        f.write("INSERT INTO work_queue (pth, added_at)\nVALUES\n")
-        for i, (blobid, uploaded, pth) in enumerate(bad_blobs):
-            safe_pth = pth.replace("'", "''")
-            if i > 0:
-                f.write(",\n")
-            f.write(f"  ('{safe_pth}', NOW())")
-        f.write("\nON CONFLICT (pth) DO NOTHING;\n\n")
-        
-        f.write(f"-- Should update {len(bad_blobs)} records\n")
-        f.write("COMMIT;\n")
-    
-    logger.info(f"SQL script written to {output_file}")
-    return output_file
-
-
-def show_summary(bad_blobs: List[Tuple[str, str, str]]):
-    """Show summary statistics about the bad blobs."""
-    if not bad_blobs:
-        return
-    
-    # Parse timestamps and find time range
-    timestamps = []
-    for _, uploaded, _ in bad_blobs:
-        try:
-            # Try different timestamp formats
-            for fmt in ["%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"]:
-                try:
-                    ts = datetime.strptime(uploaded, fmt)
-                    timestamps.append(ts)
-                    break
-                except ValueError:
-                    continue
-        except:
-            pass
-    
-    if timestamps:
-        min_time = min(timestamps)
-        max_time = max(timestamps)
-        time_span = max_time - min_time
-        
-        logger.info("\nBad Blobs Summary:")
-        logger.info(f"  Total count: {len(bad_blobs):,}")
-        logger.info(f"  Time range: {min_time} to {max_time}")
-        logger.info(f"  Time span: {time_span}")
-        logger.info(f"  First blob: {bad_blobs[0][0][:16]}...")
-        logger.info(f"  Last blob: {bad_blobs[-1][0][:16]}...")
-        
-        # Show sample paths
-        logger.info("\n  Sample paths:")
-        for i, (_, _, pth) in enumerate(bad_blobs[:3]):
-            logger.info(f"    {pth}")
-        if len(bad_blobs) > 3:
-            logger.info(f"    ... and {len(bad_blobs) - 3:,} more")
 
 
 def main():
@@ -263,15 +208,9 @@ def main():
                         default='bad-blobids',
                         nargs='?',
                         help='File containing bad blob IDs (default: bad-blobids)')
-    parser.add_argument('--generate-sql', 
-                        action='store_true',
-                        help='Generate SQL script instead of executing directly')
-    parser.add_argument('--sql-output', 
-                        default='fix_bad_blobs.sql',
-                        help='Output file for SQL script (default: fix_bad_blobs.sql)')
     parser.add_argument('--batch-size',
                         type=int,
-                        default=1000,
+                        default=100,
                         help='Batch size for database operations (default: 1000)')
     parser.add_argument('--dry-run',
                         action='store_true',
@@ -287,10 +226,9 @@ def main():
     
     setup_logging(args.verbose)
     
-    # Read bad blobs from file
+    # Read bad blobids from file
     try:
-        bad_blobs = read_bad_blobs(args.bad_blobs_file)
-        logger.info(f"Read {len(bad_blobs):,} bad blobs from {args.bad_blobs_file}")
+        bad_blobids = read_bad_blobids(args.bad_blobs_file)
     except FileNotFoundError:
         logger.error(f"File '{args.bad_blobs_file}' not found")
         sys.exit(1)
@@ -298,32 +236,19 @@ def main():
         logger.error(f"Error reading file: {e}")
         sys.exit(1)
     
-    if not bad_blobs:
-        logger.warning("No bad blobs found in file")
+    if not bad_blobids:
+        logger.warning("No bad blobids found in file")
         return
     
-    # Show summary
-    show_summary(bad_blobs)
+    # Execute database cleanup
+    if not args.yes and not args.dry_run:
+        logger.info(f"\nAbout to update database for {len(bad_blobids):,} unique blobids...")
+        confirm = input("Continue? (y/N): ")
+        if confirm.lower() != 'y':
+            logger.info("Aborted")
+            return
     
-    if args.generate_sql:
-        # Generate SQL script only
-        generate_sql_script(bad_blobs, args.sql_output)
-        logger.info(f"\nTo execute: psql -h {DB_HOST} -U {DB_USER} -d {DB_NAME} < {args.sql_output}")
-    else:
-        # Execute database cleanup
-        if not args.yes and not args.dry_run:
-            logger.info("\nAbout to update database...")
-            confirm = input("Continue? (y/N): ")
-            if confirm.lower() != 'y':
-                logger.info("Aborted")
-                return
-        
-        cleanup_database(bad_blobs, args.batch_size, args.dry_run)
-        
-        if not args.dry_run:
-            # Also generate SQL for reference
-            generate_sql_script(bad_blobs, args.sql_output)
-            logger.info(f"\nSQL script also saved to {args.sql_output} for reference")
+    cleanup_database(bad_blobids, args.batch_size, args.dry_run)
 
 
 if __name__ == "__main__":
