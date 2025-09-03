@@ -109,13 +109,14 @@ def setup_logging():
 def init_connection_pool():
     """Initialize the database connection pool."""
     global connection_pool
-    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME}"
+    # Force local timezone for all connections to prevent UTC contamination
+    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME} options='-c timezone=America/Los_Angeles'"
     connection_pool = psycopg2.pool.ThreadedConnectionPool(
         MIN_CONNECTIONS,
         MAX_CONNECTIONS,
         conn_string
     )
-    logger.info(f"Initialized connection pool with {MIN_CONNECTIONS}-{MAX_CONNECTIONS} connections")
+    logger.info(f"Initialized connection pool with {MIN_CONNECTIONS}-{MAX_CONNECTIONS} connections (timezone: America/Los_Angeles)")
 
 
 def get_db_connection():

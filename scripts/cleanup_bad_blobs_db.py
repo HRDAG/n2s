@@ -78,7 +78,8 @@ def cleanup_database(bad_blobs: List[Tuple[str, str, str]], batch_size: int = 10
         logger.info("No bad blobs to process")
         return
     
-    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME}"
+    # Force local timezone to prevent UTC contamination
+    conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME} options='-c timezone=America/Los_Angeles'"
     
     if dry_run:
         logger.info("DRY RUN MODE - No changes will be made")
