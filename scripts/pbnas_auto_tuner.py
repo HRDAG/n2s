@@ -75,8 +75,22 @@ Path(STAGING_PATH).mkdir(exist_ok=True)
 compress_queue = None
 connection_pool = None
 
+# Worker constraints
+MAX_HASH = 8
+MAX_COMPRESS = 8
+MAX_UPLOAD = 4
+
+# Disk I/O coordination
+# Limit concurrent disk reads to prevent thrashing
+# Use 2 for HDD, 3-4 for SSD
+disk_io_semaphore = mp.Semaphore(2)
+
 # Shutdown flag
 shutdown_flag = mp.Event()
+verbose_mode = False  # Global flag for workers
+
+# Global metrics tracking
+db_latencies = {'claim': [], 'dedup': [], 'update': []}
 
 
 def signal_handler(signum, frame):
@@ -94,7 +108,6 @@ def init_connection_pool():
     global connection_pool
     conn_string = f"host={DB_HOST} port=5432 user={DB_USER} dbname={DB_NAME} options='-c timezone=America/Los_Angeles'"
     connection_pool = psycopg2.pool.ThreadedConnectionPool(2, 10, conn_string)
-    logger.debug("Initialized database connection pool")
 
 
 def get_db_connection():
@@ -110,28 +123,41 @@ def return_db_connection(conn):
         connection_pool.putconn(conn)
 
 
-def claim_work(worker_id: str) -> Optional[str]:
-    """Claim a file from work_queue."""
+def claim_work(worker_id: str) -> Optional[tuple]:
+    """Claim a file from work_queue and get its size from fs table."""
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            # Claim work and get size from fs table in one query
             cur.execute("""
-                UPDATE work_queue
-                SET claimed_at = NOW(), claimed_by = %s
-                WHERE pth = (
-                    SELECT pth FROM work_queue TABLESAMPLE BERNOULLI(0.1)
-                    WHERE claimed_at IS NULL
-                    LIMIT 1
+                WITH claimed AS (
+                    UPDATE work_queue
+                    SET claimed_at = NOW(), claimed_by = %s
+                    WHERE pth = (
+                        SELECT pth FROM work_queue TABLESAMPLE BERNOULLI(0.1)
+                        WHERE claimed_at IS NULL
+                        LIMIT 1
+                    )
+                    AND claimed_at IS NULL
+                    RETURNING pth
                 )
-                AND claimed_at IS NULL
-                RETURNING pth
+                SELECT c.pth, f.size 
+                FROM claimed c
+                LEFT JOIN fs f ON c.pth = f.pth
             """, (worker_id,))
             
             result = cur.fetchone()
             conn.commit()
             
+            # Track latency
+            latency_ms = (time.perf_counter() - t0) * 1000
+            if len(db_latencies['claim']) > 1000:  # Keep last 1000
+                db_latencies['claim'].pop(0)
+            db_latencies['claim'].append(latency_ms)
+            
             if result:
-                return result[0]
+                return (result[0], result[1])  # (path, size)
             return None
                 
     except psycopg2.Error as e:
@@ -144,11 +170,20 @@ def claim_work(worker_id: str) -> Optional[str]:
 
 def check_blob_exists(blob_id: str) -> bool:
     """Check if blob already exists in database."""
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM fs WHERE blobid = %s LIMIT 1", (blob_id,))
-            return cur.fetchone() is not None
+            result = cur.fetchone() is not None
+            
+            # Track latency
+            latency_ms = (time.perf_counter() - t0) * 1000
+            if len(db_latencies['dedup']) > 1000:
+                db_latencies['dedup'].pop(0)
+            db_latencies['dedup'].append(latency_ms)
+            
+            return result
     except psycopg2.Error as e:
         logger.warning(f"Failed to check blob existence: {e}")
         return False
@@ -156,18 +191,28 @@ def check_blob_exists(blob_id: str) -> bool:
         return_db_connection(conn)
 
 
-def update_fs_table(path: str, blob_id: str, is_missing: bool = False):
+def update_fs_table(path: str, blob_id: str, is_missing: bool = False, mark_uploaded: bool = False):
     """Update fs table with blobid or missing status."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             if is_missing:
+                # Set cantfind=true and last_missing_at when file not found
                 cur.execute("""
                     UPDATE fs 
-                    SET last_missing_at = NOW()
+                    SET cantfind = true, 
+                        last_missing_at = NOW()
+                    WHERE pth = %s
+                """, (path,))
+            elif mark_uploaded:
+                # ONLY set uploaded when actually uploaded to remote
+                cur.execute("""
+                    UPDATE fs 
+                    SET uploaded = NOW()
                     WHERE pth = %s
                 """, (path,))
             else:
+                # Just set blobid when staging (NOT uploaded yet!)
                 cur.execute("""
                     UPDATE fs 
                     SET blobid = %s
@@ -205,24 +250,38 @@ class HashWorker(mp.Process):
         self.thresholds = thresholds
         self.stop_flag = mp.Event()
         self.stats = stats  # Shared manager dict
+        # Initialize timing stats
+        self.stats['read_time_ms'] = 0
+        self.stats['hash_time_ms'] = 0
+        self.stats['dedup_time_ms'] = 0
+        self.stats['queue_time_ms'] = 0
+        self.stats['total_time_ms'] = 0
+        self.stats['bytes_read'] = 0
         
     def run(self):
         """Main worker loop."""
+        # Configure worker logging
+        if not verbose_mode:
+            logger.remove()
+            logger.add(
+                sys.stdout,
+                level="INFO",
+                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+            )
         logger.info(f"HashWorker {self.worker_id} started")
         init_connection_pool()
         
         while not self.stop_flag.is_set() and not shutdown_flag.is_set():
             # Claim work
-            path = claim_work(self.worker_id)
-            if not path:
-                logger.debug(f"HashWorker {self.worker_id} no work available")
+            claim_result = claim_work(self.worker_id)
+            if not claim_result:
                 time.sleep(1)
                 continue
-            
-            logger.debug(f"HashWorker {self.worker_id} claimed: {path[:50]}...")
+                
+            path, expected_size = claim_result
                 
             try:
-                self.process_file(path)
+                self.process_file(path, expected_size)
             except Exception as e:
                 logger.error(f"Error processing {path}: {e}")
                 
@@ -230,25 +289,28 @@ class HashWorker(mp.Process):
         self.cleanup()
         logger.info(f"HashWorker {self.worker_id} stopped")
         
-    def process_file(self, path: str):
+    def process_file(self, path: str, expected_size: Optional[int]):
         """Process a single file."""
+        file_start = time.perf_counter()
         file_path = Path("/Volumes") / path
         
         # Check existence
         if not file_path.exists():
-            logger.debug(f"File not found: {path}")
             update_fs_table(path, None, is_missing=True)
             remove_from_queue(path)
             return
             
         if not file_path.is_file():
-            logger.debug(f"Skipping non-file: {path}")
             remove_from_queue(path)
             return
             
-        # Get file size
+        # Get file size and verify it matches database
+        t0 = time.perf_counter()
         size = file_path.stat().st_size
+        if expected_size is not None and size != expected_size:
+            logger.warning(f"Size mismatch for {path}: disk={size} db={expected_size}")
         self.stats['bytes_hashed'] = self.stats.get('bytes_hashed', 0) + size
+        self.stats['bytes_read'] = self.stats.get('bytes_read', 0) + size
         
         # Decide strategy based on size and thresholds
         if size <= self.thresholds.get('shared_memory_max', 10_000_000):
@@ -262,23 +324,44 @@ class HashWorker(mp.Process):
         
     def process_small_file(self, path: str, file_path: Path, size: int):
         """Small file: read once, pass through shared memory if needed."""
-        # Read file
-        data = file_path.read_bytes()
+        # Time disk read with I/O coordination
+        t0 = time.perf_counter()
+        with disk_io_semaphore:  # Prevent disk thrashing
+            data = file_path.read_bytes()
+        read_time = (time.perf_counter() - t0) * 1000
+        self.stats['read_time_ms'] = self.stats.get('read_time_ms', 0) + read_time
         
-        # Hash
+        # Time hashing
+        t0 = time.perf_counter()
         blob_id = blake3.blake3(data).hexdigest()
+        hash_time = (time.perf_counter() - t0) * 1000
+        self.stats['hash_time_ms'] = self.stats.get('hash_time_ms', 0) + hash_time
         
-        # Check dedup
-        if check_blob_exists(blob_id):
+        # Time dedup check
+        t0 = time.perf_counter()
+        exists = check_blob_exists(blob_id)
+        dedup_time = (time.perf_counter() - t0) * 1000
+        self.stats['dedup_time_ms'] = self.stats.get('dedup_time_ms', 0) + dedup_time
+        
+        if exists:
             update_fs_table(path, blob_id)
             remove_from_queue(path)
             self.stats['dedup_hits'] = self.stats.get('dedup_hits', 0) + 1
             return
             
+        # Time queue operation
+        t0 = time.perf_counter()
+        
         # Pass to compress via shared memory
         try:
             shm = shared_memory.SharedMemory(create=True, size=size)
             shm.buf[:size] = data
+            
+            # Track shared memory usage
+            if 'shm_metrics' not in self.stats:
+                self.stats['shm_metrics'] = {}
+            self.stats['shm_metrics']['active_segments'] = self.stats.get('shm_metrics', {}).get('active_segments', 0) + 1
+            self.stats['shm_metrics']['total_bytes'] = self.stats.get('shm_metrics', {}).get('total_bytes', 0) + size
             
             self.compress_queue.put({
                 'path': path,
@@ -287,6 +370,9 @@ class HashWorker(mp.Process):
                 'size': size,
                 'method': 'shared_memory'
             }, timeout=30)
+            
+            queue_time = (time.perf_counter() - t0) * 1000
+            self.stats['queue_time_ms'] = self.stats.get('queue_time_ms', 0) + queue_time
             
             shm.close()
             
@@ -302,11 +388,12 @@ class HashWorker(mp.Process):
             
     def process_medium_file(self, path: str, file_path: Path, size: int):
         """Medium file: hash first, reread if needed."""
-        # Stream hash
+        # Stream hash with I/O coordination
         hasher = blake3.blake3()
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(1_000_000):
-                hasher.update(chunk)
+        with disk_io_semaphore:  # Prevent disk thrashing
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(1_000_000):
+                    hasher.update(chunk)
                 
         blob_id = hasher.hexdigest()
         
@@ -330,11 +417,12 @@ class HashWorker(mp.Process):
             
     def process_large_file(self, path: str, file_path: Path, size: int):
         """Large file: stream everything."""
-        # Stream hash
+        # Stream hash with I/O coordination
         hasher = blake3.blake3()
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(1_000_000):
-                hasher.update(chunk)
+        with disk_io_semaphore:  # Prevent disk thrashing
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(1_000_000):
+                    hasher.update(chunk)
                 
         blob_id = hasher.hexdigest()
         
@@ -366,18 +454,42 @@ class CompressWorker(mp.Process):
         self.compress_queue = compress_queue
         self.stop_flag = mp.Event()
         self.stats = stats  # Shared manager dict
+        # Initialize timing stats
+        self.stats['wait_time_ms'] = 0
+        self.stats['work_time_ms'] = 0
+        self.stats['items_processed'] = 0
+        self.stats['idle_cycles'] = 0
         
     def run(self):
         """Main worker loop."""
+        # Configure worker logging
+        if not verbose_mode:
+            logger.remove()
+            logger.add(
+                sys.stdout,
+                level="INFO",
+                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+            )
         logger.info(f"CompressWorker {self.worker_id} started")
         init_connection_pool()
         self.active_shm = set()  # Track active shared memory segments
         
         while not self.stop_flag.is_set() and not shutdown_flag.is_set():
+            t0 = time.perf_counter()
             try:
-                item = self.compress_queue.get(timeout=1)
+                item = self.compress_queue.get(timeout=0.1)
+                wait_time = (time.perf_counter() - t0) * 1000
+                self.stats['wait_time_ms'] = self.stats.get('wait_time_ms', 0) + wait_time
+                
+                work_start = time.perf_counter()
                 self.process_item(item)
+                work_time = (time.perf_counter() - work_start) * 1000
+                self.stats['work_time_ms'] = self.stats.get('work_time_ms', 0) + work_time
+                self.stats['items_processed'] = self.stats.get('items_processed', 0) + 1
+                
             except Empty:
+                self.stats['idle_cycles'] = self.stats.get('idle_cycles', 0) + 1
+                self.stats['wait_time_ms'] = self.stats.get('wait_time_ms', 0) + 100  # timeout was 0.1s
                 continue
             except Exception as e:
                 logger.error(f"CompressWorker error: {e}")
@@ -408,13 +520,14 @@ class CompressWorker(mp.Process):
                 return
                 
         elif method == 'reread':
-            # Read from disk
+            # Read from disk with I/O coordination
             file_path = Path("/Volumes") / path
             if not file_path.exists():
                 logger.warning(f"File disappeared: {path}")
                 remove_from_queue(path)
                 return
-            data = file_path.read_bytes()
+            with disk_io_semaphore:  # Prevent disk thrashing
+                data = file_path.read_bytes()
             
         elif method == 'stream':
             # Stream compress (TODO: implement streaming)
@@ -423,7 +536,8 @@ class CompressWorker(mp.Process):
                 logger.warning(f"File disappeared: {path}")
                 remove_from_queue(path)
                 return
-            data = file_path.read_bytes()
+            with disk_io_semaphore:  # Prevent disk thrashing
+                data = file_path.read_bytes()
             
         # Compress
         compressed = self.compress_data(data)
@@ -482,7 +596,7 @@ class CompressWorker(mp.Process):
         blob_path = staging_dir / blob_id
         blob_path.write_bytes(data)
         
-        logger.trace(f"Staged blob: {blob_id[:16]}...")
+        # Blob staged successfully
         
     def cleanup(self):
         """Clean up any remaining shared memory segments."""
@@ -491,7 +605,6 @@ class CompressWorker(mp.Process):
                 shm = shared_memory.SharedMemory(name=shm_name)
                 shm.close()
                 shm.unlink()
-                logger.debug(f"Cleaned up shared memory: {shm_name}")
             except Exception:
                 pass
 
@@ -504,11 +617,20 @@ class UploadWorker(mp.Process):
         self.worker_id = worker_id
         self.thresholds = thresholds
         self.stop_flag = mp.Event()
-        self.pending = []
+        self.pending = []  # List of (rel_path, full_path) tuples
+        self.collected = set()  # Track what we've already collected
         self.last_upload = time.time()
         
     def run(self):
         """Main worker loop."""
+        # Configure worker logging
+        if not verbose_mode:
+            logger.remove()
+            logger.add(
+                sys.stdout,
+                level="INFO",
+                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+            )
         logger.info(f"UploadWorker {self.worker_id} started")
         self.total_uploaded = 0
         
@@ -532,14 +654,21 @@ class UploadWorker(mp.Process):
         logger.info(f"UploadWorker {self.worker_id} stopped (uploaded {self.total_uploaded} total)")
         
     def collect_staged(self):
-        """Collect staged files."""
+        """Collect newly staged files."""
         staging_path = Path(STAGING_PATH)
         
         for blob_path in staging_path.glob("*/*/*"):
             if blob_path.is_file():
-                # Get relative path for rsync
+                # Skip if already collected
+                path_str = str(blob_path)
+                if path_str in self.collected:
+                    continue
+                    
+                # Mark as collected and add to pending with full path for DB update
+                self.collected.add(path_str)
                 rel_path = blob_path.relative_to(staging_path)
-                self.pending.append(str(rel_path))
+                # Store both relative path (for rsync) and full path (to extract pth for DB)
+                self.pending.append((str(rel_path), str(blob_path)))
                 
                 # Don't collect too many at once
                 if len(self.pending) >= self.thresholds.get('batch_size', 100) * 2:
@@ -552,9 +681,10 @@ class UploadWorker(mp.Process):
             
         start = time.time()
         
-        # Create manifest for rsync
+        # Create manifest for rsync (just the relative paths)
         manifest_path = Path(f"/tmp/manifest_{self.worker_id}.txt")
-        manifest_path.write_text('\n'.join(self.pending))
+        rel_paths = [rel_path for rel_path, _ in self.pending]
+        manifest_path.write_text('\n'.join(rel_paths))
         
         # Batch rsync
         try:
@@ -575,17 +705,51 @@ class UploadWorker(mp.Process):
                 logger.info(
                     f"Uploaded batch: {len(self.pending)} files in {elapsed:.1f}s"
                 )
+                
+                # NOW mark files as uploaded in database
+                self.mark_files_uploaded()
+                
             else:
                 logger.error(f"Rsync failed: {result.stderr}")
+                # On error, remove from collected so we can retry
+                for _, full_path in self.pending:
+                    self.collected.discard(full_path)
                 
         except subprocess.TimeoutExpired:
             logger.error("Rsync timeout")
         except Exception as e:
             logger.error(f"Upload error: {e}")
             
+        # Clear pending but keep collected set to avoid re-collecting
         self.pending.clear()
         self.last_upload = time.time()
         manifest_path.unlink(missing_ok=True)
+        
+    def mark_files_uploaded(self):
+        """Mark files as uploaded in database after successful rsync."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                for rel_path, full_path in self.pending:
+                    # Extract the original path from the staged blob path
+                    # Staged path format: /tmp/n2s_staging/AA/BB/blobid
+                    # We need to find the file with this blobid
+                    blob_id = Path(full_path).name
+                    
+                    # Update ALL files with this blobid as uploaded
+                    cur.execute("""
+                        UPDATE fs 
+                        SET uploaded = NOW()
+                        WHERE blobid = %s AND uploaded IS NULL
+                    """, (blob_id,))
+                    
+                conn.commit()
+                
+        except psycopg2.Error as e:
+            logger.error(f"Failed to mark files as uploaded: {e}")
+            conn.rollback()
+        finally:
+            return_db_connection(conn)
 
 
 class AutoTuningOrchestrator:
@@ -623,8 +787,29 @@ class AutoTuningOrchestrator:
             'last_tune': time.time(),
         }
         
+        # System I/O tracking
+        self.last_disk_io = psutil.disk_io_counters()
+        self.last_net_io = psutil.net_io_counters()
+        self.last_io_time = time.time()
+        
         # Tuning parameters
         self.tune_interval = 30  # seconds
+        self.aggressive_tune = True  # Start aggressive, learn over time
+        
+        # Throughput tracking for smarter tuning
+        self.throughput_history = []  # List of (timestamp, files/sec, config)
+        self.last_tuning_action = None  # What we did last
+        self.last_throughput_before_tuning = 0
+        self.tuning_cooldown = 30  # Wait this long to measure impact
+        
+        # Create tuning log directory
+        self.tuning_log_path = Path.home() / ".n2s" / "tuning.log"
+        self.tuning_log_path.parent.mkdir(exist_ok=True)
+        
+        # Maintenance parameters
+        self.maintenance_interval = 300  # 5 minutes
+        self.last_maintenance = time.time()
+        self.stale_claim_minutes = 30
         self.min_workers = 1
         self.max_workers = mp.cpu_count() * 2
         
@@ -643,18 +828,31 @@ class AutoTuningOrchestrator:
         self.spawn_hash_workers(2)
         self.spawn_compress_workers(2)
         self.spawn_upload_workers(1)
+        logger.info(f"Initial workers: Hash={len(self.hash_workers)} Compress={len(self.compress_workers)} Upload={len(self.upload_workers)}")
         
         # Main loop
+        stats_counter = 0
         while not shutdown_flag.is_set():
             time.sleep(5)
+            stats_counter += 5
             
             # Tune periodically
             if time.time() - self.metrics['last_tune'] > self.tune_interval:
                 self.tune()
                 self.metrics['last_tune'] = time.time()
                 
+            # Maintenance periodically
+            if time.time() - self.last_maintenance > self.maintenance_interval:
+                self.run_maintenance()
+                self.last_maintenance = time.time()
+                
             # Print stats
             self.print_stats()
+            
+            # Print separator every minute for readability
+            if stats_counter >= 60:
+                logger.info("-" * 80)
+                stats_counter = 0
             
         # Shutdown
         self.shutdown()
@@ -669,7 +867,8 @@ class AutoTuningOrchestrator:
             self.hash_workers.append(worker)
             self.hash_stats.append(stats)
             
-        logger.info(f"Spawned {count} hash workers (total: {len(self.hash_workers)})")
+        # Don't log spawns during tuning, the tune() method will log it
+        pass
         
     def spawn_compress_workers(self, count: int):
         """Spawn compress workers."""
@@ -681,7 +880,8 @@ class AutoTuningOrchestrator:
             self.compress_workers.append(worker)
             self.compress_stats.append(stats)
             
-        logger.info(f"Spawned {count} compress workers (total: {len(self.compress_workers)})")
+        # Don't log spawns during tuning, the tune() method will log it
+        pass
         
     def spawn_upload_workers(self, count: int):
         """Spawn upload workers."""
@@ -691,48 +891,110 @@ class AutoTuningOrchestrator:
             worker.start()
             self.upload_workers.append(worker)
             
-        logger.info(f"Spawned {count} upload workers (total: {len(self.upload_workers)})")
+        # Don't log spawns during tuning, the tune() method will log it
+        pass
         
     def tune(self):
-        """Auto-tune worker counts and thresholds."""
-        # Get metrics
+        """Auto-tune based on THROUGHPUT changes."""
+        
+        # Calculate current throughput
+        elapsed = time.time() - self.metrics['start_time']
+        total_processed = sum(s.get('files_processed', 0) for s in self.hash_stats)
+        current_throughput = total_processed / max(1, elapsed)
+        
+        # Track throughput history
+        current_config = (len(self.hash_workers), len(self.compress_workers), len(self.upload_workers))
+        self.throughput_history.append((time.time(), current_throughput, current_config))
+        
+        # Keep only last 10 measurements
+        if len(self.throughput_history) > 10:
+            self.throughput_history.pop(0)
+        
+        # Check if we're in cooldown period after last tuning
+        if self.last_tuning_action and (time.time() - self.last_tuning_action['time']) < self.tuning_cooldown:
+            return  # Still measuring impact of last change
+        
+        # Analyze throughput trend
+        throughput_trend = "stable"
+        if len(self.throughput_history) >= 3:
+            recent_throughputs = [h[1] for h in self.throughput_history[-3:]]
+            if recent_throughputs[-1] > recent_throughputs[0] * 1.1:
+                throughput_trend = "improving"
+            elif recent_throughputs[-1] < recent_throughputs[0] * 0.9:
+                throughput_trend = "declining"
+        
+        # If last action made things worse, try opposite
+        if self.last_tuning_action and throughput_trend == "declining":
+            logger.info(f"🔴 Last tuning made things worse (was {self.last_throughput_before_tuning:.1f} f/s, now {current_throughput:.1f} f/s)")
+            
+            # Revert or try opposite
+            if "Hash+" in self.last_tuning_action['action']:
+                # Added hash workers didn't help, try compress
+                if len(self.compress_workers) < MAX_COMPRESS:
+                    self.spawn_compress_workers(1)
+                    self.record_tuning_action("Compress+1", current_throughput)
+            elif "Compress+" in self.last_tuning_action['action']:
+                # Added compress didn't help, try hash
+                if len(self.hash_workers) < MAX_HASH:
+                    self.spawn_hash_workers(1)
+                    self.record_tuning_action("Hash+1", current_throughput)
+            return
+        
+        # If throughput is improving, maybe try more of the same
+        if throughput_trend == "improving" and self.last_tuning_action:
+            logger.info(f"🟢 Throughput improving ({current_throughput:.1f} f/s)")
+            # Could repeat last action if it helped
+            return
+        
+        # If stable or no recent action, try something new
+        if throughput_trend == "stable":
+            # Experimental probing - try different things
+            staged_files = len(list(Path(STAGING_PATH).glob("*/*/*")))
+            worker_ratio = len(self.compress_workers) / max(1, len(self.hash_workers))
+            
+            # Decision tree based on bottleneck indicators
+            if staged_files > 200:
+                # Backlog at staging - upload is slow
+                if len(self.upload_workers) < MAX_UPLOAD:
+                    self.spawn_upload_workers(1)
+                    self.record_tuning_action("Upload+1", current_throughput)
+            elif worker_ratio > 2:
+                # Try more hash workers
+                if len(self.hash_workers) < MAX_HASH:
+                    self.spawn_hash_workers(1)
+                    self.record_tuning_action("Hash+1", current_throughput)
+            else:
+                # Try more compress workers
+                if len(self.compress_workers) < MAX_COMPRESS:
+                    self.spawn_compress_workers(1)
+                    self.record_tuning_action("Compress+1", current_throughput)
+                    
+    def record_tuning_action(self, action: str, current_throughput: float):
+        """Record what tuning action we took."""
+        self.last_tuning_action = {
+            'action': action,
+            'time': time.time(),
+            'config': (len(self.hash_workers), len(self.compress_workers), len(self.upload_workers))
+        }
+        self.last_throughput_before_tuning = current_throughput
+        logger.info(f"🎯 TUNING: {action} (baseline: {current_throughput:.1f} f/s)")
+        
+        # Write to persistent log
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "baseline_throughput": current_throughput,
+            "workers": {
+                "hash": len(self.hash_workers),
+                "compress": len(self.compress_workers),
+                "upload": len(self.upload_workers)
+            }
+        }
         try:
-            compress_queue_size = self.compress_queue.qsize()
-        except NotImplementedError:
-            # macOS doesn't support qsize, use approximation
-            compress_queue_size = 50  # Assume medium load
-        staged_files = len(list(Path(STAGING_PATH).glob("*/*/*")))
-        
-        logger.info(f"Tuning: compress_queue={compress_queue_size}, staged={staged_files}")
-        
-        # Tune hash workers
-        if compress_queue_size < 10 and len(self.hash_workers) < self.max_workers:
-            self.spawn_hash_workers(1)
-        elif compress_queue_size > 80 and len(self.hash_workers) > self.min_workers:
-            self.remove_hash_worker()
-            
-        # Tune compress workers
-        if compress_queue_size > 50 and len(self.compress_workers) < self.max_workers:
-            if psutil.cpu_percent(interval=1) < 70:
-                self.spawn_compress_workers(1)
-        elif compress_queue_size < 5 and len(self.compress_workers) > self.min_workers:
-            self.remove_compress_worker()
-            
-        # Tune upload workers
-        if staged_files > 1000 and len(self.upload_workers) < 3:
-            self.spawn_upload_workers(1)
-            self.thresholds['batch_size'] = min(500, int(self.thresholds['batch_size'] * 1.5))
-        elif staged_files < 100 and len(self.upload_workers) > 1:
-            self.remove_upload_worker()
-            
-        # Tune memory thresholds
-        mem_available = psutil.virtual_memory().available
-        if mem_available > 20_000_000_000:  # 20GB
-            self.thresholds['shared_memory_max'] = min(100_000_000, 
-                                                       int(self.thresholds['shared_memory_max'] * 1.2))
-        elif mem_available < 5_000_000_000:  # 5GB
-            self.thresholds['shared_memory_max'] = max(1_000_000,
-                                                       int(self.thresholds['shared_memory_max'] * 0.8))
+            with open(self.tuning_log_path, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to write tuning log: {e}")
                                                        
     def remove_hash_worker(self):
         """Remove a hash worker."""
@@ -740,7 +1002,6 @@ class AutoTuningOrchestrator:
             worker = self.hash_workers.pop(0)
             self.hash_stats.pop(0)
             worker.stop_flag.set()
-            logger.info(f"Removing hash worker (remaining: {len(self.hash_workers)})")
             
     def remove_compress_worker(self):
         """Remove a compress worker."""
@@ -748,36 +1009,361 @@ class AutoTuningOrchestrator:
             worker = self.compress_workers.pop(0)
             self.compress_stats.pop(0)
             worker.stop_flag.set()
-            logger.info(f"Removing compress worker (remaining: {len(self.compress_workers)})")
             
     def remove_upload_worker(self):
         """Remove an upload worker."""
         if self.upload_workers:
             worker = self.upload_workers.pop(0)
             worker.stop_flag.set()
-            logger.info(f"Removing upload worker (remaining: {len(self.upload_workers)})")
+            
+    def run_maintenance(self):
+        """Run periodic maintenance tasks."""
+        logger.info("🔧 MAINTENANCE: Running queue cleanup...")
+        conn = get_db_connection()
+        
+        try:
+            with conn.cursor() as cur:
+                # Reset stale claims
+                cur.execute("""
+                    UPDATE work_queue 
+                    SET claimed_at = NULL, claimed_by = NULL
+                    WHERE claimed_at < NOW() - INTERVAL '%s minutes'
+                    RETURNING pth
+                """, (self.stale_claim_minutes,))
+                
+                reset_count = cur.rowcount
+                if reset_count > 0:
+                    logger.info(f"  Reset {reset_count} stale claims")
+                
+                # Remove completed files from queue
+                cur.execute("""
+                    DELETE FROM work_queue
+                    WHERE pth IN (
+                        SELECT wq.pth
+                        FROM work_queue wq
+                        JOIN fs ON fs.pth = wq.pth
+                        WHERE fs.blobid IS NOT NULL
+                           OR fs.last_missing_at IS NOT NULL
+                           OR fs.cantfind = true
+                    )
+                """)
+                
+                removed_count = cur.rowcount
+                if removed_count > 0:
+                    logger.info(f"  Removed {removed_count} completed files from queue")
+                
+                # Vacuum analyze work_queue (less frequently)
+                if hasattr(self, 'vacuum_counter'):
+                    self.vacuum_counter += 1
+                else:
+                    self.vacuum_counter = 1
+                    
+                if self.vacuum_counter % 12 == 0:  # Every hour
+                    old_isolation = conn.isolation_level
+                    conn.set_isolation_level(0)  # VACUUM requires autocommit
+                    cur.execute("VACUUM ANALYZE work_queue")
+                    conn.set_isolation_level(old_isolation)
+                    logger.info("  Vacuumed work_queue table")
+                
+                conn.commit()
+                
+        except psycopg2.Error as e:
+            logger.error(f"Maintenance error: {e}")
+            conn.rollback()
+        finally:
+            return_db_connection(conn)
+    
+    def collect_system_metrics(self):
+        """Collect system I/O and resource metrics."""
+        current_time = time.time()
+        time_delta = current_time - self.last_io_time
+        
+        # Disk I/O
+        disk_io = psutil.disk_io_counters()
+        disk_read_mbps = (disk_io.read_bytes - self.last_disk_io.read_bytes) / time_delta / 1_000_000
+        disk_write_mbps = (disk_io.write_bytes - self.last_disk_io.write_bytes) / time_delta / 1_000_000
+        
+        # Network I/O
+        net_io = psutil.net_io_counters()
+        net_upload_mbps = (net_io.bytes_sent - self.last_net_io.bytes_sent) / time_delta / 1_000_000
+        
+        # Update last values
+        self.last_disk_io = disk_io
+        self.last_net_io = net_io
+        self.last_io_time = current_time
+        
+        # CPU per core
+        cpu_per_core = psutil.cpu_percent(interval=0.1, percpu=True)
+        
+        # Memory details
+        mem = psutil.virtual_memory()
+        
+        # Shared memory tracking
+        shm_bytes = 0
+        shm_segments = 0
+        for stats in self.hash_stats:
+            if 'shm_metrics' in stats:
+                shm_bytes += stats['shm_metrics'].get('total_bytes', 0)
+                shm_segments += stats['shm_metrics'].get('active_segments', 0)
+        
+        # Process memory
+        process = psutil.Process()
+        process_mem = process.memory_info()
+        
+        return {
+            'disk_read_mbps': disk_read_mbps,
+            'disk_write_mbps': disk_write_mbps,
+            'net_upload_mbps': net_upload_mbps,
+            'cpu_per_core': cpu_per_core,
+            'cpu_max_core': max(cpu_per_core) if cpu_per_core else 0,
+            'mem_total_gb': mem.total / 1_000_000_000,
+            'mem_used_gb': mem.used / 1_000_000_000,
+            'mem_available_gb': mem.available / 1_000_000_000,
+            'mem_percent': mem.percent,
+            'shm_bytes_mb': shm_bytes / 1_000_000,
+            'shm_segments': shm_segments,
+            'process_rss_mb': process_mem.rss / 1_000_000,
+            'process_vms_mb': process_mem.vms / 1_000_000
+        }
+    
+    def calculate_worker_efficiency(self, worker_stats: list, worker_type: str) -> dict:
+        """Calculate worker efficiency metrics."""
+        if not worker_stats:
+            return {}
+            
+        if worker_type == 'hash':
+            total_read = sum(s.get('read_time_ms', 0) for s in worker_stats)
+            total_hash = sum(s.get('hash_time_ms', 0) for s in worker_stats)
+            total_dedup = sum(s.get('dedup_time_ms', 0) for s in worker_stats)
+            total_time = total_read + total_hash + total_dedup
+            
+            if total_time > 0:
+                return {
+                    'read_pct': (total_read / total_time) * 100,
+                    'hash_pct': (total_hash / total_time) * 100,
+                    'dedup_pct': (total_dedup / total_time) * 100,
+                    'bytes_per_sec': sum(s.get('bytes_read', 0) for s in worker_stats) / max(1, total_time/1000)
+                }
+        
+        elif worker_type == 'compress':
+            total_wait = sum(s.get('wait_time_ms', 0) for s in worker_stats)
+            total_work = sum(s.get('work_time_ms', 0) for s in worker_stats)
+            total_time = total_wait + total_work
+            
+            if total_time > 0:
+                return {
+                    'idle_pct': (total_wait / total_time) * 100,
+                    'work_pct': (total_work / total_time) * 100,
+                    'items': sum(s.get('items_processed', 0) for s in worker_stats)
+                }
+        
+        return {}
+    
+    def calculate_db_stats(self) -> dict:
+        """Calculate database latency statistics."""
+        import numpy as np
+        
+        stats = {}
+        for query_type in ['claim', 'dedup']:
+            if db_latencies[query_type]:
+                stats[query_type] = {
+                    'p50': np.percentile(db_latencies[query_type], 50),
+                    'p95': np.percentile(db_latencies[query_type], 95),
+                    'p99': np.percentile(db_latencies[query_type], 99)
+                }
+        return stats
+    
+    def print_detailed_metrics(self, hash_eff: dict, compress_eff: dict, sys_metrics: dict, db_stats: dict):
+        """Print detailed metrics dashboard."""
+        logger.info("-" * 80)
+        logger.info("BOTTLENECK ANALYSIS:")
+        
+        if hash_eff:
+            logger.info(
+                f"├─ Hash Workers: {hash_eff.get('read_pct', 0):.0f}% reading, "
+                f"{hash_eff.get('hash_pct', 0):.0f}% hashing, "
+                f"{hash_eff.get('dedup_pct', 0):.0f}% DB"
+            )
+            
+        if compress_eff:
+            logger.info(
+                f"├─ Compress Workers: {compress_eff.get('idle_pct', 0):.0f}% idle, "
+                f"{compress_eff.get('work_pct', 0):.0f}% working"
+            )
+            
+        logger.info(
+            f"├─ I/O: Read={sys_metrics['disk_read_mbps']:.1f}MB/s "
+            f"Write={sys_metrics['disk_write_mbps']:.1f}MB/s "
+            f"Upload={sys_metrics['net_upload_mbps']:.1f}MB/s"
+        )
+        
+        logger.info(
+            f"├─ Memory: {sys_metrics['mem_used_gb']:.1f}GB/{sys_metrics['mem_total_gb']:.1f}GB "
+            f"({sys_metrics['mem_percent']:.0f}%) | "
+            f"Shared: {sys_metrics['shm_bytes_mb']:.1f}MB/{sys_metrics['shm_segments']:.0f} segs | "
+            f"Process: {sys_metrics['process_rss_mb']:.0f}MB"
+        )
+        
+        logger.info(
+            f"├─ CPU: Max core={sys_metrics['cpu_max_core']:.0f}% "
+        )
+        
+        if db_stats:
+            if 'claim' in db_stats:
+                logger.info(
+                    f"├─ DB Claim: p50={db_stats['claim']['p50']:.0f}ms "
+                    f"p95={db_stats['claim']['p95']:.0f}ms"
+                )
+            if 'dedup' in db_stats:
+                logger.info(
+                    f"└─ DB Dedup: p50={db_stats['dedup']['p50']:.0f}ms "
+                    f"p95={db_stats['dedup']['p95']:.0f}ms"
+                )
+        
+        # Diagnosis
+        diagnosis = self.diagnose_bottleneck(hash_eff, compress_eff, sys_metrics)
+        logger.info(f"DIAGNOSIS: {diagnosis}")
+        logger.info("-" * 80)
+    
+    def diagnose_bottleneck(self, hash_eff: dict, compress_eff: dict, sys_metrics: dict) -> str:
+        """Diagnose the system bottleneck based on metrics."""
+        if sys_metrics.get('mem_percent', 0) > 90:
+            return "MEMORY CRITICAL - reduce workers or batch size"
+        elif sys_metrics.get('shm_bytes_mb', 0) > 3.5:  # macOS limit is 4MB
+            return "Shared memory near limit - process smaller files differently"
+        elif compress_eff.get('idle_pct', 0) > 60:
+            return "Add hash workers (compress workers starved)"
+        elif hash_eff.get('read_pct', 0) > 70:
+            return "I/O bound - disk read is bottleneck"
+        elif hash_eff.get('dedup_pct', 0) > 30:
+            return "Database is slow - optimize queries"
+        elif sys_metrics['cpu_max_core'] > 90:
+            return "CPU bound - at capacity"
+        elif sys_metrics['net_upload_mbps'] < 1 and len(list(Path(STAGING_PATH).glob("*/*/*"))) > 50:
+            return "Network upload is slow"
+        elif sys_metrics.get('mem_percent', 0) > 80:
+            return "Memory pressure high - monitor closely"
+        else:
+            return "System balanced - monitor for changes"
             
     def print_stats(self):
-        """Print current statistics."""
+        """Print current statistics with detailed metrics."""
         elapsed = time.time() - self.metrics['start_time']
         
         # Collect worker stats from shared dicts
         total_processed = sum(s.get('files_processed', 0) for s in self.hash_stats)
         total_dedup = sum(s.get('dedup_hits', 0) for s in self.hash_stats)
         total_compressed = sum(s.get('files_compressed', 0) for s in self.compress_stats)
+        total_bytes = sum(s.get('bytes_hashed', 0) for s in self.hash_stats)
         
-        # qsize() doesn't work on macOS, use approximation
+        # Get queue sizes
         try:
-            queue_size = self.compress_queue.qsize()
+            compress_queue_size = self.compress_queue.qsize()
         except NotImplementedError:
-            queue_size = "?"
+            compress_queue_size = -1  # Use -1 as sentinel for macOS
+            
+        # Count staged files
+        staged_files = len(list(Path(STAGING_PATH).glob("*/*/*")))
         
-        logger.info(
-            f"[{elapsed:.0f}s] Workers: H={len(self.hash_workers)} "
-            f"C={len(self.compress_workers)} U={len(self.upload_workers)} | "
-            f"Processed: {total_processed} | Dedup: {total_dedup} | "
-            f"Compressed: {total_compressed} | Queue: {queue_size}"
-        )
+        # Get remaining work from database
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM work_queue WHERE claimed_at IS NULL")
+                remaining_work = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM work_queue WHERE claimed_at IS NOT NULL")
+                claimed_work = cur.fetchone()[0]
+        except:
+            remaining_work = 0
+            claimed_work = 0
+        finally:
+            return_db_connection(conn)
+            
+        # Calculate rates
+        if elapsed > 0:
+            hash_rate = total_processed / elapsed
+            compress_rate = total_compressed / elapsed
+            throughput_mb = total_bytes / elapsed / 1_000_000
+        else:
+            hash_rate = compress_rate = throughput_mb = 0
+            
+        # Calculate ETA
+        total_remaining = remaining_work + claimed_work
+        if hash_rate > 0 and total_remaining > 0:
+            eta_seconds = total_remaining / hash_rate
+            eta_str = humanize.naturaldelta(eta_seconds)
+        else:
+            eta_str = "unknown"
+            
+        # Worker status line (contention indicators)
+        queue_indicator = ""
+        if compress_queue_size == -1:  # macOS
+            queue_indicator = "[?]"
+        elif compress_queue_size > 80:
+            queue_indicator = "[HIGH]"
+        elif compress_queue_size > 50:
+            queue_indicator = "[MED]"
+        else:
+            queue_indicator = "[LOW]"
+            
+        stage_indicator = ""
+        if staged_files > 500:
+            stage_indicator = "[BACKLOG]"
+        elif staged_files > 200:
+            stage_indicator = "[BUSY]"
+        else:
+            stage_indicator = "[OK]"
+            
+        # Calculate contention indicators
+        cpu_pct = psutil.cpu_percent(interval=0.1)
+        mem_pct = psutil.virtual_memory().percent
+        
+        # Contention/pressure indicators - adjusted for macOS
+        bottleneck = ""
+        if compress_queue_size == -1:
+            # macOS: infer from worker ratio and CPU
+            if len(self.compress_workers) < len(self.hash_workers) and cpu_pct < 50:
+                bottleneck = "[C-SLOW]"  # Likely compress bottleneck
+            elif staged_files > 500:
+                bottleneck = "[U-SLOW]"
+            else:
+                bottleneck = "[OK]"
+        elif compress_queue_size > 70:
+            bottleneck = "[C-SLOW]"
+        elif staged_files > 500:
+            bottleneck = "[U-SLOW]"
+        elif claimed_work < len(self.hash_workers) * 2:
+            bottleneck = "[DB-LAG]"
+        elif cpu_pct > 90:
+            bottleneck = "[CPU-MAX]"
+        elif mem_pct > 85:
+            bottleneck = "[MEM-HIGH]"
+        else:
+            bottleneck = "[OK]"
+            
+        # Collect detailed metrics
+        sys_metrics = self.collect_system_metrics()
+        
+        # Calculate worker efficiency
+        hash_efficiency = self.calculate_worker_efficiency(self.hash_stats, 'hash')
+        compress_efficiency = self.calculate_worker_efficiency(self.compress_stats, 'compress')
+        
+        # Database latency percentiles
+        db_stats = self.calculate_db_stats()
+        
+        # Print compact stats
+        if elapsed > 0:
+            logger.info(
+                f"[{elapsed:>4.0f}s] H:{len(self.hash_workers)} C:{len(self.compress_workers)} U:{len(self.upload_workers)} | "
+                f"{hash_rate:>5.1f}f/s {throughput_mb:>5.1f}MB/s | "
+                f"Done:{total_processed:>6,} Queue:{total_remaining:>7,} | "
+                f"{bottleneck:>9}"
+            )
+            
+            # Every 30 seconds, show detailed metrics
+            if int(elapsed) % 30 == 0 and elapsed > 0:
+                self.print_detailed_metrics(hash_efficiency, compress_efficiency, sys_metrics, db_stats)
         
     def shutdown(self):
         """Shutdown all workers gracefully."""
@@ -814,7 +1400,6 @@ class AutoTuningOrchestrator:
         all_workers = self.hash_workers + self.compress_workers + self.upload_workers
         
         for i, worker in enumerate(all_workers):
-            logger.debug(f"Waiting for {worker.worker_id}...")
             worker.join(timeout=10)
             if worker.is_alive():
                 logger.warning(f"Force terminating {worker.worker_id}")
@@ -853,8 +1438,33 @@ class AutoTuningOrchestrator:
 
 def main():
     """Main entry point."""
+    import argparse
+    global verbose_mode
+    
+    parser = argparse.ArgumentParser(description="Auto-tuning blob processor")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    args = parser.parse_args()
+    
+    verbose_mode = args.verbose
+    
+    # Configure logging
     logger.remove()
-    logger.add(sys.stdout, level="INFO")
+    log_level = "DEBUG" if args.verbose else "INFO"
+    
+    if args.verbose:
+        # Verbose mode: include module and line number
+        logger.add(
+            sys.stdout, 
+            level=log_level,
+            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {name}:{line} | <level>{message}</level>"
+        )
+    else:
+        # Normal mode: clean output
+        logger.add(
+            sys.stdout, 
+            level=log_level,
+            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+        )
     
     logger.info("\n" + "="*60)
     logger.info("PBNAS AUTO-TUNING BLOB PROCESSOR")
