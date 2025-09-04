@@ -353,11 +353,6 @@ class SimpleDBWorker(mp.Process):
                 self.stats['db_removals'] = self.stats.get('db_removals', 0) + len(batch)
                         
         except psycopg2.Error as e:
-            logger.error(f"Batch dedup check failed: {e}")
-        finally:
-            return_db_connection(conn)
-            
-        except psycopg2.Error as e:
             logger.error(f"Batch removal failed: {e}")
             conn.rollback()
         finally:
