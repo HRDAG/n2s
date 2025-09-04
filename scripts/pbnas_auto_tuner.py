@@ -966,7 +966,8 @@ class AutoTuningOrchestrator:
         self.throughput_history = []  # List of (timestamp, files/sec, config)
         self.last_tuning_action = None  # What we did last
         self.last_throughput_before_tuning = 0
-        self.tuning_cooldown = 30  # Wait this long to measure impact
+        self.tuning_cooldown = 20  # Wait this long to measure impact (less than tune_interval!)
+        self.action_blacklist = {}  # Failed actions -> timestamp when blacklist expires
         
         # Create tuning log directory
         self.tuning_log_path = Path.home() / ".n2s" / "tuning.log"
@@ -1070,6 +1071,8 @@ class AutoTuningOrchestrator:
         current_files_per_sec = total_processed / max(1, elapsed)
         current_mb_per_sec = total_bytes / max(1, elapsed) / 1_000_000
         
+        logger.debug(f"Tuning check: {current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s")
+        
         # Track throughput history (now includes MB/s)
         current_config = (len(self.hash_workers), len(self.compress_workers), len(self.upload_workers))
         self.throughput_history.append((
@@ -1085,6 +1088,8 @@ class AutoTuningOrchestrator:
         
         # Check if we're in cooldown period after last tuning
         if self.last_tuning_action and (time.time() - self.last_tuning_action['time']) < self.tuning_cooldown:
+            remaining = self.tuning_cooldown - (time.time() - self.last_tuning_action['time'])
+            logger.debug(f"In cooldown for {remaining:.0f}s after {self.last_tuning_action['action']}")
             return  # Still measuring impact of last change
         
         # Analyze throughput trend (prioritize MB/s over files/sec)
