@@ -244,14 +244,23 @@ def remove_from_queue(path: str):
 class DBWorker(mp.Process):
     """Dedicated worker for database operations."""
     
-    def __init__(self, worker_id: str, work_queue: mp.Queue, dedup_queue: mp.Queue, complete_queue: mp.Queue):
+    def __init__(self, worker_id: str, 
+                 claim_request_queue: mp.Queue, claim_response_queue: mp.Queue,
+                 dedup_request_queue: mp.Queue, dedup_response_queue: mp.Queue,
+                 complete_queue: mp.Queue, compress_queue: mp.Queue,
+                 stats: dict):
         super().__init__()
         self.worker_id = worker_id
-        self.work_queue = work_queue  # Receives paths to claim
-        self.dedup_queue = dedup_queue  # Receives (path, blob_id) to check
-        self.complete_queue = complete_queue  # Receives paths to mark complete
+        # Request/response queues
+        self.claim_request_queue = claim_request_queue  # Receives worker_id requesting work
+        self.claim_response_queue = claim_response_queue  # Sends (worker_id, path, size) back
+        self.dedup_request_queue = dedup_request_queue  # Receives (path, blob_id, size, data_ref)
+        self.dedup_response_queue = dedup_response_queue  # Sends (path, exists, blob_id)
+        self.complete_queue = complete_queue  # Receives (path, blob_id) to mark complete
+        self.compress_queue = compress_queue  # Forward non-dedup files here
         self.stop_flag = mp.Event()
         self.batch_size = 50  # Batch operations for efficiency
+        self.stats = stats  # Shared stats
         
     def run(self):
         """Main worker loop."""
@@ -266,15 +275,15 @@ class DBWorker(mp.Process):
         while not self.stop_flag.is_set() and not shutdown_flag.is_set():
             # Process claim requests
             try:
-                while not self.work_queue.empty() and len(claim_batch) < self.batch_size:
-                    claim_batch.append(self.work_queue.get_nowait())
+                while not self.claim_request_queue.empty() and len(claim_batch) < self.batch_size:
+                    claim_batch.append(self.claim_request_queue.get_nowait())
             except:
                 pass
                 
             # Process dedup checks
             try:
-                while not self.dedup_queue.empty() and len(dedup_batch) < self.batch_size:
-                    dedup_batch.append(self.dedup_queue.get_nowait())
+                while not self.dedup_request_queue.empty() and len(dedup_batch) < self.batch_size:
+                    dedup_batch.append(self.dedup_request_queue.get_nowait())
             except:
                 pass
                 
@@ -305,29 +314,34 @@ class DBWorker(mp.Process):
             
         logger.info(f"DBWorker {self.worker_id} stopped")
         
-    def process_claims(self, paths: list):
-        """Batch claim files from work_queue."""
-        if not paths:
+    def process_claims(self, worker_ids: list):
+        """Batch claim files from work_queue for requesting workers."""
+        if not worker_ids:
             return
             
         conn = get_db_connection()
         try:
             with conn.cursor() as cur:
-                # Claim multiple files at once
-                cur.execute("""
-                    UPDATE work_queue
-                    SET claimed_at = NOW(), claimed_by = %s
-                    WHERE pth = ANY(%s) AND claimed_at IS NULL
-                    RETURNING pth
-                """, (self.worker_id, paths))
+                # Claim files for each requesting worker
+                for worker_id in worker_ids:
+                    cur.execute("""
+                        UPDATE work_queue
+                        SET claimed_at = NOW(), claimed_by = %s
+                        WHERE claimed_at IS NULL
+                        LIMIT 1
+                        RETURNING pth, sz
+                    """, (worker_id,))
+                    
+                    result = cur.fetchone()
+                    if result:
+                        path, size = result
+                        # Send claimed work back to requesting worker
+                        self.claim_response_queue.put((worker_id, path, size))
+                    else:
+                        # No work available
+                        self.claim_response_queue.put((worker_id, None, None))
                 
-                claimed = cur.fetchall()
                 conn.commit()
-                
-                # Return claimed paths to hash workers
-                for (path,) in claimed:
-                    # TODO: Send to hash workers via another queue
-                    pass
                     
         except psycopg2.Error as e:
             logger.error(f"Batch claim failed: {e}")
@@ -336,7 +350,7 @@ class DBWorker(mp.Process):
             return_db_connection(conn)
             
     def process_dedups(self, items: list):
-        """Batch check if blobs exist."""
+        """Batch check if blobs exist and update database."""
         if not items:
             return
             
@@ -354,36 +368,57 @@ class DBWorker(mp.Process):
                 existing = set(row[0] for row in cur.fetchall())
                 
                 # Process results
-                for path, blob_id in items:
+                for path, blob_id, size, data_ref in items:
                     if blob_id in existing:
-                        # Mark as deduplicated
-                        # TODO: Update fs table
-                        pass
+                        # Update fs table with dedup hit
+                        cur.execute("""
+                            UPDATE fs SET blobid = %s
+                            WHERE pth = %s
+                        """, (blob_id, path))
+                        
+                        # Remove from work queue
+                        cur.execute("""
+                            DELETE FROM work_queue WHERE pth = %s
+                        """, (path,))
+                        
+                        # Send dedup result back
+                        self.dedup_response_queue.put((path, True, blob_id))
+                        self.stats['dedup_hits'] = self.stats.get('dedup_hits', 0) + 1
                     else:
-                        # Send to compress queue
-                        # TODO: Send to compress workers
-                        pass
+                        # Not a duplicate - send to compress
+                        self.compress_queue.put((path, blob_id, data_ref))
+                        self.dedup_response_queue.put((path, False, blob_id))
+                
+                conn.commit()
                         
         except psycopg2.Error as e:
             logger.error(f"Batch dedup check failed: {e}")
         finally:
             return_db_connection(conn)
             
-    def process_completions(self, paths: list):
-        """Batch remove completed files from queue."""
-        if not paths:
+    def process_completions(self, items: list):
+        """Batch remove completed files from queue and update fs table."""
+        if not items:
             return
             
         conn = get_db_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    DELETE FROM work_queue 
-                    WHERE pth = ANY(%s)
-                """, (paths,))
+                for path, blob_id in items:
+                    # Update fs table
+                    cur.execute("""
+                        UPDATE fs SET blobid = %s
+                        WHERE pth = %s
+                    """, (blob_id, path))
+                    
+                    # Remove from work queue
+                    cur.execute("""
+                        DELETE FROM work_queue 
+                        WHERE pth = %s
+                    """, (path,))
                 
                 conn.commit()
-                logger.debug(f"Removed {cur.rowcount} files from queue")
+                self.stats['files_completed'] = self.stats.get('files_completed', 0) + len(items)
                 
         except psycopg2.Error as e:
             logger.error(f"Batch completion failed: {e}")
@@ -1701,8 +1736,68 @@ class AutoTuningOrchestrator:
             if int(elapsed) % 30 == 0 and elapsed > 0:
                 self.print_detailed_metrics(hash_efficiency, compress_efficiency, sys_metrics, db_stats)
         
+    def emergency_upload(self, remaining_files: list):
+        """Upload any files that didn't get uploaded during normal shutdown."""
+        if not remaining_files:
+            return
+            
+        staging_path = Path(STAGING_PATH)
+        
+        # Create manifest for rsync
+        manifest_path = Path("/tmp/emergency_manifest.txt")
+        rel_paths = [str(f.relative_to(staging_path)) for f in remaining_files]
+        manifest_path.write_text('\n'.join(rel_paths))
+        
+        # Batch rsync
+        try:
+            result = subprocess.run([
+                "rsync",
+                "-av",
+                "--files-from", str(manifest_path),
+                "--relative",
+                "--remove-source-files",  # Delete after upload
+                "-e", f"ssh -p {SSH_PORT} -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=60",
+                STAGING_PATH,
+                f"{UPLOAD_HOST}:{UPLOAD_PATH}/"
+            ], capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0:
+                logger.info(f"Emergency upload successful: {len(remaining_files)} files")
+                
+                # Mark files as uploaded in database
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cur:
+                        for file_path in remaining_files:
+                            # Extract original path from staging path structure
+                            # e.g., staging/12/34/1234...json.lz4 -> extract from JSON
+                            try:
+                                with lz4.frame.open(file_path, 'rb') as f:
+                                    metadata = json.load(f)
+                                    original_path = metadata['pth']
+                                    
+                                cur.execute("""
+                                    UPDATE work_queue
+                                    SET uploaded_at = NOW()
+                                    WHERE pth = %s AND uploaded_at IS NULL
+                                """, (original_path,))
+                        conn.commit()
+                        logger.info(f"Updated database for {len(remaining_files)} emergency uploads")
+                except Exception as e:
+                    logger.error(f"Failed to update DB after emergency upload: {e}")
+                    conn.rollback()
+                finally:
+                    return_db_connection(conn)
+            else:
+                logger.error(f"Emergency upload failed: {result.stderr}")
+        except Exception as e:
+            logger.error(f"Emergency upload error: {e}")
+        finally:
+            # Clean up manifest
+            if manifest_path.exists():
+                manifest_path.unlink()
+    
     def shutdown(self):
-        """Shutdown all workers gracefully."""
         logger.info("\n" + "="*60)
         logger.info("Initiating graceful shutdown...")
         logger.info("="*60)
@@ -1733,24 +1828,32 @@ class AutoTuningOrchestrator:
             
         # Wait for workers with progress updates
         logger.info("Waiting for workers to complete...")
-        all_workers = self.hash_workers + self.compress_workers + self.upload_workers
         
-        for i, worker in enumerate(all_workers):
+        # Wait for hash and compress workers first
+        for worker in self.hash_workers + self.compress_workers:
             worker.join(timeout=10)
             if worker.is_alive():
                 logger.warning(f"Force terminating {worker.worker_id}")
                 worker.terminate()
                 worker.join(timeout=2)
-            
-        # Clean up staging directory
-        logger.info("Cleaning up staging directory...")
-        staged_count = 0
-        for blob_path in Path(STAGING_PATH).glob("*/*/*"):
-            if blob_path.is_file():
-                staged_count += 1
         
-        if staged_count > 0:
-            logger.warning(f"Found {staged_count} un-uploaded files in staging")
+        # Give upload workers more time to finish
+        logger.info("Waiting for upload workers to finish...")
+        for worker in self.upload_workers:
+            worker.join(timeout=30)  # More time for uploads
+            if worker.is_alive():
+                logger.warning(f"Force terminating {worker.worker_id}")
+                worker.terminate()
+                worker.join(timeout=2)
+            
+        # Check for any remaining staged files and upload them
+        logger.info("Checking for remaining staged files...")
+        remaining_files = list(Path(STAGING_PATH).glob("*/*/*"))
+        if remaining_files:
+            logger.info(f"Found {len(remaining_files)} un-uploaded files, performing final upload...")
+            self.emergency_upload(remaining_files)
+        else:
+            logger.info("All files uploaded successfully")
             
         # Print final statistics
         elapsed = time.time() - self.metrics['start_time']
