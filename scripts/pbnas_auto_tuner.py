@@ -92,6 +92,7 @@ verbose_mode = False  # Global flag for workers
 # Global metrics tracking
 db_latencies = {'claim': [], 'dedup': [], 'update': []}
 disk_read_latencies = []  # Track disk read times for thrashing detection
+db_ops_queue = None  # Will be set by orchestrator for async DB ops
 
 
 def signal_handler(signum, frame):
@@ -194,6 +195,12 @@ def check_blob_exists(blob_id: str) -> bool:
 
 def update_fs_table(path: str, blob_id: str, is_missing: bool = False, mark_uploaded: bool = False):
     """Update fs table with blobid or missing status."""
+    # Use async DB operations when available (except for missing/uploaded flags)
+    if db_ops_queue is not None and not is_missing and not mark_uploaded:
+        db_ops_queue.put(('update_fs', (path, blob_id)))
+        return
+        
+    # Synchronous fallback or for special cases
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -229,6 +236,12 @@ def update_fs_table(path: str, blob_id: str, is_missing: bool = False, mark_uplo
 
 def remove_from_queue(path: str):
     """Remove file from work_queue after processing."""
+    # Use async DB operations when available
+    if db_ops_queue is not None:
+        db_ops_queue.put(('remove_queue', path))
+        return
+        
+    # Synchronous fallback
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -241,107 +254,82 @@ def remove_from_queue(path: str):
         return_db_connection(conn)
 
 
-class DBWorker(mp.Process):
-    """Dedicated worker for database operations."""
+class SimpleDBWorker(mp.Process):
+    """Simplified DB worker - just handles async DB operations without changing data flow."""
     
-    def __init__(self, worker_id: str, 
-                 claim_request_queue: mp.Queue, claim_response_queue: mp.Queue,
-                 dedup_request_queue: mp.Queue, dedup_response_queue: mp.Queue,
-                 complete_queue: mp.Queue, compress_queue: mp.Queue,
-                 stats: dict):
+    def __init__(self, worker_id: str, db_ops_queue: mp.Queue, stats: dict):
         super().__init__()
         self.worker_id = worker_id
-        # Request/response queues
-        self.claim_request_queue = claim_request_queue  # Receives worker_id requesting work
-        self.claim_response_queue = claim_response_queue  # Sends (worker_id, path, size) back
-        self.dedup_request_queue = dedup_request_queue  # Receives (path, blob_id, size, data_ref)
-        self.dedup_response_queue = dedup_response_queue  # Sends (path, exists, blob_id)
-        self.complete_queue = complete_queue  # Receives (path, blob_id) to mark complete
-        self.compress_queue = compress_queue  # Forward non-dedup files here
+        self.db_ops_queue = db_ops_queue  # Receives (op_type, data) tuples
         self.stop_flag = mp.Event()
-        self.batch_size = 50  # Batch operations for efficiency
-        self.stats = stats  # Shared stats
+        self.batch_size = 50
+        self.stats = stats
         
     def run(self):
         """Main worker loop."""
-        logger.info(f"DBWorker {self.worker_id} started")
+        logger.info(f"SimpleDBWorker {self.worker_id} started")
         init_connection_pool()
         
-        claim_batch = []
-        dedup_batch = []
-        complete_batch = []
+        update_batch = []  # For fs table updates
+        remove_batch = []  # For work_queue removals
         last_flush = time.time()
         
         while not self.stop_flag.is_set() and not shutdown_flag.is_set():
-            # Process claim requests
+            # Collect operations
             try:
-                while not self.claim_request_queue.empty() and len(claim_batch) < self.batch_size:
-                    claim_batch.append(self.claim_request_queue.get_nowait())
+                while not self.db_ops_queue.empty():
+                    op_type, data = self.db_ops_queue.get_nowait()
+                    
+                    if op_type == 'update_fs':
+                        update_batch.append(data)
+                    elif op_type == 'remove_queue':
+                        remove_batch.append(data)
+                    
+                    # Flush if batch is full
+                    if len(update_batch) >= self.batch_size:
+                        self.flush_updates(update_batch)
+                        update_batch = []
+                    if len(remove_batch) >= self.batch_size:
+                        self.flush_removals(remove_batch)
+                        remove_batch = []
             except:
                 pass
-                
-            # Process dedup checks
-            try:
-                while not self.dedup_request_queue.empty() and len(dedup_batch) < self.batch_size:
-                    dedup_batch.append(self.dedup_request_queue.get_nowait())
-            except:
-                pass
-                
-            # Process completions
-            try:
-                while not self.complete_queue.empty() and len(complete_batch) < self.batch_size:
-                    complete_batch.append(self.complete_queue.get_nowait())
-            except:
-                pass
-                
-            # Flush batches if full or timeout
-            if len(claim_batch) >= self.batch_size or (len(claim_batch) > 0 and time.time() - last_flush > 0.1):
-                self.process_claims(claim_batch)
-                claim_batch = []
-                
-            if len(dedup_batch) >= self.batch_size or (len(dedup_batch) > 0 and time.time() - last_flush > 0.1):
-                self.process_dedups(dedup_batch)
-                dedup_batch = []
-                
-            if len(complete_batch) >= self.batch_size or (len(complete_batch) > 0 and time.time() - last_flush > 0.1):
-                self.process_completions(complete_batch)
-                complete_batch = []
-                
-            if time.time() - last_flush > 0.1:
+            
+            # Flush on timeout
+            if time.time() - last_flush > 0.5:
+                if update_batch:
+                    self.flush_updates(update_batch)
+                    update_batch = []
+                if remove_batch:
+                    self.flush_removals(remove_batch)
+                    remove_batch = []
                 last_flush = time.time()
                 
-            time.sleep(0.01)  # Small sleep to prevent CPU spin
+            time.sleep(0.01)
             
-        logger.info(f"DBWorker {self.worker_id} stopped")
+        # Final flush
+        if update_batch:
+            self.flush_updates(update_batch)
+        if remove_batch:
+            self.flush_removals(remove_batch)
+            
+        logger.info(f"SimpleDBWorker {self.worker_id} stopped")
         
-    def process_claims(self, worker_ids: list):
-        """Batch claim files from work_queue for requesting workers."""
-        if not worker_ids:
+    def flush_updates(self, batch: list):
+        """Batch update fs table."""
+        if not batch:
             return
             
         conn = get_db_connection()
         try:
             with conn.cursor() as cur:
-                # Claim files for each requesting worker
-                for worker_id in worker_ids:
+                for path, blob_id in batch:
                     cur.execute("""
-                        UPDATE work_queue
-                        SET claimed_at = NOW(), claimed_by = %s
-                        WHERE claimed_at IS NULL
-                        LIMIT 1
-                        RETURNING pth, sz
-                    """, (worker_id,))
-                    
-                    result = cur.fetchone()
-                    if result:
-                        path, size = result
-                        # Send claimed work back to requesting worker
-                        self.claim_response_queue.put((worker_id, path, size))
-                    else:
-                        # No work available
-                        self.claim_response_queue.put((worker_id, None, None))
-                
+                        UPDATE fs SET blobid = %s
+                        WHERE pth = %s
+                    """, (blob_id, path))
                 conn.commit()
+                self.stats['db_updates'] = self.stats.get('db_updates', 0) + len(batch)
                     
         except psycopg2.Error as e:
             logger.error(f"Batch claim failed: {e}")
@@ -349,79 +337,28 @@ class DBWorker(mp.Process):
         finally:
             return_db_connection(conn)
             
-    def process_dedups(self, items: list):
-        """Batch check if blobs exist and update database."""
-        if not items:
+    def flush_removals(self, batch: list):
+        """Batch remove from work_queue."""
+        if not batch:
             return
             
         conn = get_db_connection()
         try:
             with conn.cursor() as cur:
-                blob_ids = [item[1] for item in items]
-                
-                # Check all blob_ids at once
                 cur.execute("""
-                    SELECT blobid FROM fs 
-                    WHERE blobid = ANY(%s)
-                """, (blob_ids,))
-                
-                existing = set(row[0] for row in cur.fetchall())
-                
-                # Process results
-                for path, blob_id, size, data_ref in items:
-                    if blob_id in existing:
-                        # Update fs table with dedup hit
-                        cur.execute("""
-                            UPDATE fs SET blobid = %s
-                            WHERE pth = %s
-                        """, (blob_id, path))
-                        
-                        # Remove from work queue
-                        cur.execute("""
-                            DELETE FROM work_queue WHERE pth = %s
-                        """, (path,))
-                        
-                        # Send dedup result back
-                        self.dedup_response_queue.put((path, True, blob_id))
-                        self.stats['dedup_hits'] = self.stats.get('dedup_hits', 0) + 1
-                    else:
-                        # Not a duplicate - send to compress
-                        self.compress_queue.put((path, blob_id, data_ref))
-                        self.dedup_response_queue.put((path, False, blob_id))
-                
+                    DELETE FROM work_queue
+                    WHERE pth = ANY(%s)
+                """, (batch,))
                 conn.commit()
+                self.stats['db_removals'] = self.stats.get('db_removals', 0) + len(batch)
                         
         except psycopg2.Error as e:
             logger.error(f"Batch dedup check failed: {e}")
         finally:
             return_db_connection(conn)
             
-    def process_completions(self, items: list):
-        """Batch remove completed files from queue and update fs table."""
-        if not items:
-            return
-            
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                for path, blob_id in items:
-                    # Update fs table
-                    cur.execute("""
-                        UPDATE fs SET blobid = %s
-                        WHERE pth = %s
-                    """, (blob_id, path))
-                    
-                    # Remove from work queue
-                    cur.execute("""
-                        DELETE FROM work_queue 
-                        WHERE pth = %s
-                    """, (path,))
-                
-                conn.commit()
-                self.stats['files_completed'] = self.stats.get('files_completed', 0) + len(items)
-                
         except psycopg2.Error as e:
-            logger.error(f"Batch completion failed: {e}")
+            logger.error(f"Batch removal failed: {e}")
             conn.rollback()
         finally:
             return_db_connection(conn)
@@ -950,18 +887,22 @@ class AutoTuningOrchestrator:
     
     def __init__(self):
         # Create queues
-        global compress_queue
+        global compress_queue, db_ops_queue
         compress_queue = mp.Queue(maxsize=100)
         self.compress_queue = compress_queue
+        db_ops_queue = mp.Queue(maxsize=1000)  # For async DB operations
+        self.db_ops_queue = db_ops_queue
         
         # Worker pools
         self.hash_workers = []
         self.compress_workers = []
         self.upload_workers = []
+        self.db_worker = None  # Single DB worker for async operations
         
         # Shared worker stats
         self.hash_stats = []
         self.compress_stats = []
+        self.db_stats = self.manager.dict()  # Stats for DB worker
         
         # Tunable thresholds
         self.manager = mp.Manager()
@@ -1025,6 +966,11 @@ class AutoTuningOrchestrator:
         
         # Initialize database pool
         init_connection_pool()
+        
+        # Start DB worker for async operations
+        self.db_worker = SimpleDBWorker("db_0", self.db_ops_queue, self.db_stats)
+        self.db_worker.start()
+        logger.info("Started DB worker for async operations")
         
         # Start initial workers
         self.spawn_hash_workers(2)
@@ -1813,6 +1759,11 @@ class AutoTuningOrchestrator:
         for worker in self.hash_workers:
             worker.stop_flag.set()
             
+        # Stop DB worker (let it finish pending operations)
+        if self.db_worker:
+            logger.info("Stopping DB worker...")
+            self.db_worker.stop_flag.set()
+            
         # Give hash workers time to finish current files
         time.sleep(2)
         
@@ -1836,6 +1787,14 @@ class AutoTuningOrchestrator:
                 logger.warning(f"Force terminating {worker.worker_id}")
                 worker.terminate()
                 worker.join(timeout=2)
+                
+        # Wait for DB worker
+        if self.db_worker:
+            self.db_worker.join(timeout=10)
+            if self.db_worker.is_alive():
+                logger.warning("Force terminating DB worker")
+                self.db_worker.terminate()
+                self.db_worker.join(timeout=2)
         
         # Give upload workers more time to finish
         logger.info("Waiting for upload workers to finish...")
