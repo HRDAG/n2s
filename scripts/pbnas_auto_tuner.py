@@ -1727,6 +1727,9 @@ class AutoTuningOrchestrator:
                                     SET uploaded_at = NOW()
                                     WHERE pth = %s AND uploaded_at IS NULL
                                 """, (original_path,))
+                            except Exception as e:
+                                logger.error(f"Failed to process {file_path}: {e}")
+                                continue
                         conn.commit()
                         logger.info(f"Updated database for {len(remaining_files)} emergency uploads")
                 except Exception as e:
