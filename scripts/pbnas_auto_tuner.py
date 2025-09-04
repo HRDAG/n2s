@@ -38,6 +38,7 @@ Data flow:
 import json
 import multiprocessing as mp
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -81,9 +82,8 @@ MAX_COMPRESS = 8
 MAX_UPLOAD = 4
 
 # Disk I/O coordination
-# Limit concurrent disk reads to prevent thrashing
-# Use 2 for HDD, 3-4 for SSD
-disk_io_semaphore = mp.Semaphore(2)
+# Default value - can be overridden by orchestrator
+disk_io_semaphore = mp.Semaphore(3)  # Safe default
 
 # Shutdown flag
 shutdown_flag = mp.Event()
@@ -91,6 +91,7 @@ verbose_mode = False  # Global flag for workers
 
 # Global metrics tracking
 db_latencies = {'claim': [], 'dedup': [], 'update': []}
+disk_read_latencies = []  # Track disk read times for thrashing detection
 
 
 def signal_handler(signum, frame):
@@ -240,6 +241,157 @@ def remove_from_queue(path: str):
         return_db_connection(conn)
 
 
+class DBWorker(mp.Process):
+    """Dedicated worker for database operations."""
+    
+    def __init__(self, worker_id: str, work_queue: mp.Queue, dedup_queue: mp.Queue, complete_queue: mp.Queue):
+        super().__init__()
+        self.worker_id = worker_id
+        self.work_queue = work_queue  # Receives paths to claim
+        self.dedup_queue = dedup_queue  # Receives (path, blob_id) to check
+        self.complete_queue = complete_queue  # Receives paths to mark complete
+        self.stop_flag = mp.Event()
+        self.batch_size = 50  # Batch operations for efficiency
+        
+    def run(self):
+        """Main worker loop."""
+        logger.info(f"DBWorker {self.worker_id} started")
+        init_connection_pool()
+        
+        claim_batch = []
+        dedup_batch = []
+        complete_batch = []
+        last_flush = time.time()
+        
+        while not self.stop_flag.is_set() and not shutdown_flag.is_set():
+            # Process claim requests
+            try:
+                while not self.work_queue.empty() and len(claim_batch) < self.batch_size:
+                    claim_batch.append(self.work_queue.get_nowait())
+            except:
+                pass
+                
+            # Process dedup checks
+            try:
+                while not self.dedup_queue.empty() and len(dedup_batch) < self.batch_size:
+                    dedup_batch.append(self.dedup_queue.get_nowait())
+            except:
+                pass
+                
+            # Process completions
+            try:
+                while not self.complete_queue.empty() and len(complete_batch) < self.batch_size:
+                    complete_batch.append(self.complete_queue.get_nowait())
+            except:
+                pass
+                
+            # Flush batches if full or timeout
+            if len(claim_batch) >= self.batch_size or (len(claim_batch) > 0 and time.time() - last_flush > 0.1):
+                self.process_claims(claim_batch)
+                claim_batch = []
+                
+            if len(dedup_batch) >= self.batch_size or (len(dedup_batch) > 0 and time.time() - last_flush > 0.1):
+                self.process_dedups(dedup_batch)
+                dedup_batch = []
+                
+            if len(complete_batch) >= self.batch_size or (len(complete_batch) > 0 and time.time() - last_flush > 0.1):
+                self.process_completions(complete_batch)
+                complete_batch = []
+                
+            if time.time() - last_flush > 0.1:
+                last_flush = time.time()
+                
+            time.sleep(0.01)  # Small sleep to prevent CPU spin
+            
+        logger.info(f"DBWorker {self.worker_id} stopped")
+        
+    def process_claims(self, paths: list):
+        """Batch claim files from work_queue."""
+        if not paths:
+            return
+            
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # Claim multiple files at once
+                cur.execute("""
+                    UPDATE work_queue
+                    SET claimed_at = NOW(), claimed_by = %s
+                    WHERE pth = ANY(%s) AND claimed_at IS NULL
+                    RETURNING pth
+                """, (self.worker_id, paths))
+                
+                claimed = cur.fetchall()
+                conn.commit()
+                
+                # Return claimed paths to hash workers
+                for (path,) in claimed:
+                    # TODO: Send to hash workers via another queue
+                    pass
+                    
+        except psycopg2.Error as e:
+            logger.error(f"Batch claim failed: {e}")
+            conn.rollback()
+        finally:
+            return_db_connection(conn)
+            
+    def process_dedups(self, items: list):
+        """Batch check if blobs exist."""
+        if not items:
+            return
+            
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                blob_ids = [item[1] for item in items]
+                
+                # Check all blob_ids at once
+                cur.execute("""
+                    SELECT blobid FROM fs 
+                    WHERE blobid = ANY(%s)
+                """, (blob_ids,))
+                
+                existing = set(row[0] for row in cur.fetchall())
+                
+                # Process results
+                for path, blob_id in items:
+                    if blob_id in existing:
+                        # Mark as deduplicated
+                        # TODO: Update fs table
+                        pass
+                    else:
+                        # Send to compress queue
+                        # TODO: Send to compress workers
+                        pass
+                        
+        except psycopg2.Error as e:
+            logger.error(f"Batch dedup check failed: {e}")
+        finally:
+            return_db_connection(conn)
+            
+    def process_completions(self, paths: list):
+        """Batch remove completed files from queue."""
+        if not paths:
+            return
+            
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM work_queue 
+                    WHERE pth = ANY(%s)
+                """, (paths,))
+                
+                conn.commit()
+                logger.debug(f"Removed {cur.rowcount} files from queue")
+                
+        except psycopg2.Error as e:
+            logger.error(f"Batch completion failed: {e}")
+            conn.rollback()
+        finally:
+            return_db_connection(conn)
+
+
 class HashWorker(mp.Process):
     """Read files, hash them, check dedup, pass to compress if needed."""
     
@@ -330,6 +482,12 @@ class HashWorker(mp.Process):
             data = file_path.read_bytes()
         read_time = (time.perf_counter() - t0) * 1000
         self.stats['read_time_ms'] = self.stats.get('read_time_ms', 0) + read_time
+        
+        # Track read latency for thrashing detection
+        global disk_read_latencies
+        disk_read_latencies.append(read_time)
+        if len(disk_read_latencies) > 100:  # Keep last 100 readings
+            disk_read_latencies.pop(0)
         
         # Time hashing
         t0 = time.perf_counter()
@@ -772,12 +930,20 @@ class AutoTuningOrchestrator:
         
         # Tunable thresholds
         self.manager = mp.Manager()
+        # Initial thresholds - will be dynamically adjusted based on memory pressure
+        available_ram = psutil.virtual_memory().available
         self.thresholds = self.manager.dict({
-            'shared_memory_max': 10_000_000,  # 10MB
+            'shared_memory_max': 1_000_000_000,  # Start at 1GB! We have plenty of RAM
             'reread_threshold': 50_000_000,   # 50MB
             'batch_size': 100,
             'batch_wait': 5.0,
+            'disk_io_semaphores': 3,  # Start with 3, tune based on performance
         })
+        
+        # Create the global semaphore with initial value
+        global disk_io_semaphore
+        disk_io_semaphore = mp.Semaphore(self.thresholds['disk_io_semaphores'])
+        logger.info(f"Initialized with shared_memory_max={humanize.naturalsize(self.thresholds['shared_memory_max'])}, disk_io_semaphores={self.thresholds['disk_io_semaphores']}")
         
         # Performance metrics
         self.metrics = {
@@ -895,16 +1061,23 @@ class AutoTuningOrchestrator:
         pass
         
     def tune(self):
-        """Auto-tune based on THROUGHPUT changes."""
+        """Auto-tune based on THROUGHPUT changes (both files/sec and MB/sec)."""
         
-        # Calculate current throughput
+        # Calculate current throughput metrics
         elapsed = time.time() - self.metrics['start_time']
         total_processed = sum(s.get('files_processed', 0) for s in self.hash_stats)
-        current_throughput = total_processed / max(1, elapsed)
+        total_bytes = sum(s.get('bytes_hashed', 0) for s in self.hash_stats)
+        current_files_per_sec = total_processed / max(1, elapsed)
+        current_mb_per_sec = total_bytes / max(1, elapsed) / 1_000_000
         
-        # Track throughput history
+        # Track throughput history (now includes MB/s)
         current_config = (len(self.hash_workers), len(self.compress_workers), len(self.upload_workers))
-        self.throughput_history.append((time.time(), current_throughput, current_config))
+        self.throughput_history.append((
+            time.time(), 
+            current_files_per_sec, 
+            current_mb_per_sec,
+            current_config
+        ))
         
         # Keep only last 10 measurements
         if len(self.throughput_history) > 10:
@@ -914,76 +1087,129 @@ class AutoTuningOrchestrator:
         if self.last_tuning_action and (time.time() - self.last_tuning_action['time']) < self.tuning_cooldown:
             return  # Still measuring impact of last change
         
-        # Analyze throughput trend
+        # Analyze throughput trend (prioritize MB/s over files/sec)
         throughput_trend = "stable"
         if len(self.throughput_history) >= 3:
-            recent_throughputs = [h[1] for h in self.throughput_history[-3:]]
-            if recent_throughputs[-1] > recent_throughputs[0] * 1.1:
+            # Check MB/s trend (more important than file count)
+            recent_mb_per_sec = [h[2] for h in self.throughput_history[-3:]]
+            recent_files_per_sec = [h[1] for h in self.throughput_history[-3:]]
+            
+            # MB/s is primary metric
+            if recent_mb_per_sec[-1] > recent_mb_per_sec[0] * 1.1:
                 throughput_trend = "improving"
-            elif recent_throughputs[-1] < recent_throughputs[0] * 0.9:
+            elif recent_mb_per_sec[-1] < recent_mb_per_sec[0] * 0.9:
+                throughput_trend = "declining"
+            # If MB/s stable, check files/sec
+            elif recent_files_per_sec[-1] > recent_files_per_sec[0] * 1.1:
+                throughput_trend = "improving"
+            elif recent_files_per_sec[-1] < recent_files_per_sec[0] * 0.9:
                 throughput_trend = "declining"
         
-        # If last action made things worse, try opposite
+        # If last action made things worse, blacklist it and try opposite
         if self.last_tuning_action and throughput_trend == "declining":
-            logger.info(f"🔴 Last tuning made things worse (was {self.last_throughput_before_tuning:.1f} f/s, now {current_throughput:.1f} f/s)")
+            logger.info(f"🔴 Last tuning made things worse (was {self.last_throughput_before_tuning:.1f} f/s, now {current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s)")
+            
+            # Blacklist the failed action for 5 minutes
+            failed_action = self.last_tuning_action['action'].split('+')[0] if '+' in self.last_tuning_action['action'] else self.last_tuning_action['action']
+            self.action_blacklist[failed_action] = time.time() + 300  # 5 minute blacklist
+            logger.info(f"Blacklisting {failed_action} actions for 5 minutes")
             
             # Revert or try opposite
             if "Hash+" in self.last_tuning_action['action']:
                 # Added hash workers didn't help, try compress
-                if len(self.compress_workers) < MAX_COMPRESS:
+                if len(self.compress_workers) < MAX_COMPRESS and not self.is_blacklisted("Compress"):
                     self.spawn_compress_workers(1)
-                    self.record_tuning_action("Compress+1", current_throughput)
+                    self.record_tuning_action("Compress+1", current_files_per_sec, current_mb_per_sec)
             elif "Compress+" in self.last_tuning_action['action']:
                 # Added compress didn't help, try hash
-                if len(self.hash_workers) < MAX_HASH:
+                if len(self.hash_workers) < MAX_HASH and not self.is_blacklisted("Hash"):
                     self.spawn_hash_workers(1)
-                    self.record_tuning_action("Hash+1", current_throughput)
+                    self.record_tuning_action("Hash+1", current_files_per_sec, current_mb_per_sec)
             return
         
         # If throughput is improving, maybe try more of the same
         if throughput_trend == "improving" and self.last_tuning_action:
-            logger.info(f"🟢 Throughput improving ({current_throughput:.1f} f/s)")
+            logger.info(f"🟢 Throughput improving ({current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s)")
             # Could repeat last action if it helped
             return
         
         # If stable or no recent action, try something new
         if throughput_trend == "stable":
+            # Get worker efficiency metrics
+            compress_idle_pct = self.get_compress_idle_percentage()
+            
             # Experimental probing - try different things
             staged_files = len(list(Path(STAGING_PATH).glob("*/*/*")))
             worker_ratio = len(self.compress_workers) / max(1, len(self.hash_workers))
             
+            # First, check if we can adjust memory thresholds based on pressure
+            mem = psutil.virtual_memory()
+            if mem.percent < 60 and self.thresholds['shared_memory_max'] < 2_000_000_000:
+                # Plenty of memory available, increase threshold (up to 2GB)
+                old_max = self.thresholds['shared_memory_max']
+                new_max = min(2_000_000_000, int(old_max * 1.5))
+                self.thresholds['shared_memory_max'] = new_max
+                logger.info(f"🎯 TUNING: Memory threshold {humanize.naturalsize(old_max)} → {humanize.naturalsize(new_max)} (mem: {mem.percent:.0f}%)")
+                self.record_tuning_action(f"MemMax→{humanize.naturalsize(new_max)}", current_files_per_sec, current_mb_per_sec)
+                return
+            elif mem.percent > 85 and self.thresholds['shared_memory_max'] > 100_000_000:
+                # Memory pressure high, reduce threshold (but keep at least 100MB)
+                old_max = self.thresholds['shared_memory_max']
+                new_max = max(100_000_000, int(old_max * 0.5))
+                self.thresholds['shared_memory_max'] = new_max
+                logger.info(f"🎯 TUNING: Memory threshold {humanize.naturalsize(old_max)} → {humanize.naturalsize(new_max)} (mem: {mem.percent:.0f}% HIGH)")
+                self.record_tuning_action(f"MemMax→{humanize.naturalsize(new_max)}", current_files_per_sec, current_mb_per_sec)
+                return
+            
             # Decision tree based on bottleneck indicators
             if staged_files > 200:
                 # Backlog at staging - upload is slow
-                if len(self.upload_workers) < MAX_UPLOAD:
+                if len(self.upload_workers) < MAX_UPLOAD and not self.is_blacklisted("Upload"):
                     self.spawn_upload_workers(1)
-                    self.record_tuning_action("Upload+1", current_throughput)
-            elif worker_ratio > 2:
-                # Try more hash workers
-                if len(self.hash_workers) < MAX_HASH:
+                    self.record_tuning_action("Upload+1", current_files_per_sec, current_mb_per_sec)
+            elif compress_idle_pct > 80 or worker_ratio > 1.5:
+                # Compress workers are starved - need more hash workers
+                if len(self.hash_workers) < MAX_HASH and not self.is_blacklisted("Hash"):
                     self.spawn_hash_workers(1)
-                    self.record_tuning_action("Hash+1", current_throughput)
+                    self.record_tuning_action("Hash+1", current_files_per_sec, current_mb_per_sec)
+                elif worker_ratio > 2 and len(self.compress_workers) > 2:
+                    # Too many compress workers, remove one
+                    self.remove_compress_worker()
+                    self.record_tuning_action("Compress-1", current_files_per_sec, current_mb_per_sec)
+                elif len(self.hash_workers) > 2:
+                    # Check for disk thrashing and adjust semaphores
+                    is_thrashing, thrash_ratio = self.detect_disk_thrashing()
+                    if is_thrashing and thrash_ratio > 10 and self.thresholds['disk_io_semaphores'] > 1:
+                        # Severe thrashing - reduce semaphores
+                        self.adjust_disk_semaphores(-1)
+                        self.record_tuning_action(f"Semaphores-1→{self.thresholds['disk_io_semaphores']} (thrashing)", current_files_per_sec, current_mb_per_sec)
+                    elif not is_thrashing and self.thresholds['disk_io_semaphores'] < len(self.hash_workers):
+                        # No thrashing and could use more concurrent reads
+                        self.adjust_disk_semaphores(1)
+                        self.record_tuning_action(f"Semaphores+1→{self.thresholds['disk_io_semaphores']}", current_files_per_sec, current_mb_per_sec)
             else:
                 # Try more compress workers
-                if len(self.compress_workers) < MAX_COMPRESS:
+                if len(self.compress_workers) < MAX_COMPRESS and worker_ratio < 1.5 and not self.is_blacklisted("Compress"):
                     self.spawn_compress_workers(1)
-                    self.record_tuning_action("Compress+1", current_throughput)
+                    self.record_tuning_action("Compress+1", current_files_per_sec, current_mb_per_sec)
                     
-    def record_tuning_action(self, action: str, current_throughput: float):
+    def record_tuning_action(self, action: str, current_files_per_sec: float, current_mb_per_sec: float):
         """Record what tuning action we took."""
         self.last_tuning_action = {
             'action': action,
             'time': time.time(),
             'config': (len(self.hash_workers), len(self.compress_workers), len(self.upload_workers))
         }
-        self.last_throughput_before_tuning = current_throughput
-        logger.info(f"🎯 TUNING: {action} (baseline: {current_throughput:.1f} f/s)")
+        self.last_throughput_before_tuning = current_files_per_sec
+        self.last_mb_per_sec_before_tuning = current_mb_per_sec
+        logger.info(f"🎯 TUNING: {action} (baseline: {current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s)")
         
         # Write to persistent log
         log_entry = {
             "timestamp": datetime.now().isoformat(),
             "action": action,
-            "baseline_throughput": current_throughput,
+            "baseline_files_per_sec": current_files_per_sec,
+            "baseline_mb_per_sec": current_mb_per_sec,
             "workers": {
                 "hash": len(self.hash_workers),
                 "compress": len(self.compress_workers),
@@ -995,6 +1221,111 @@ class AutoTuningOrchestrator:
                 f.write(json.dumps(log_entry) + "\n")
         except Exception as e:
             logger.warning(f"Failed to write tuning log: {e}")
+    
+    def is_blacklisted(self, action_type: str) -> bool:
+        """Check if an action type is currently blacklisted."""
+        if action_type in self.action_blacklist:
+            if time.time() < self.action_blacklist[action_type]:
+                return True
+            else:
+                # Expired, remove from blacklist
+                del self.action_blacklist[action_type]
+        return False
+    
+    def get_compress_idle_percentage(self) -> float:
+        """Calculate percentage of time compress workers are idle."""
+        if not self.compress_stats:
+            return 0
+        
+        total_wait = sum(s.get('wait_time_ms', 0) for s in self.compress_stats)
+        total_work = sum(s.get('work_time_ms', 0) for s in self.compress_stats)
+        total_time = total_wait + total_work
+        
+        if total_time > 0:
+            return (total_wait / total_time) * 100
+        return 0
+    
+    def adjust_disk_semaphores(self, delta: int):
+        """Adjust the number of disk I/O semaphores."""
+        global disk_io_semaphore
+        
+        old_count = self.thresholds['disk_io_semaphores']
+        new_count = max(1, min(8, old_count + delta))  # Between 1 and 8
+        
+        if new_count != old_count:
+            self.thresholds['disk_io_semaphores'] = new_count
+            # Note: We can't actually change the semaphore count at runtime
+            # Workers will need to restart to use the new value
+            # For now, just log the change
+            logger.info(f"Disk I/O semaphores: {old_count} → {new_count}")
+            # TODO: Implement worker restart to apply new semaphore count
+    
+    def detect_disk_thrashing(self) -> tuple[bool, float]:
+        """Detect if disk is thrashing based on read latencies."""
+        global disk_read_latencies
+        
+        if len(disk_read_latencies) < 20:
+            return False, 0.0
+        
+        # Calculate p50 and p95
+        import numpy as np
+        sorted_latencies = sorted(disk_read_latencies)
+        p50 = np.percentile(sorted_latencies, 50)
+        p95 = np.percentile(sorted_latencies, 95)
+        
+        # High ratio means high variability = likely thrashing
+        if p50 > 0:
+            thrashing_ratio = p95 / p50
+            
+            # Log if concerning
+            if thrashing_ratio > 10:
+                logger.warning(f"Disk thrashing detected! P50: {p50:.1f}ms, P95: {p95:.1f}ms, ratio: {thrashing_ratio:.1f}")
+                return True, thrashing_ratio
+            elif thrashing_ratio > 5:
+                logger.info(f"Disk latency variability high. P50: {p50:.1f}ms, P95: {p95:.1f}ms, ratio: {thrashing_ratio:.1f}")
+                return True, thrashing_ratio
+        
+        return False, thrashing_ratio if p50 > 0 else 0.0
+    
+    def get_memory_pressure_action(self) -> Optional[str]:
+        """Determine if memory adjustments are needed based on pressure."""
+        mem = psutil.virtual_memory()
+        current_max = self.thresholds['shared_memory_max']
+        
+        # Get process-specific memory usage
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)  # All child processes
+        self_usage = resource.getrusage(resource.RUSAGE_SELF)  # This process
+        
+        # On macOS ru_maxrss is in bytes, on Linux it's in KB
+        if sys.platform == 'darwin':
+            process_rss_mb = (usage.ru_maxrss + self_usage.ru_maxrss) / 1024 / 1024
+        else:
+            process_rss_mb = (usage.ru_maxrss + self_usage.ru_maxrss) / 1024
+        
+        # Track shared memory actually in use
+        shm_in_use = sum(s.get('shm_metrics', {}).get('total_bytes', 0) for s in self.hash_stats)
+        
+        # Calculate our process family's impact on system
+        our_memory_pct = (process_rss_mb * 1024 * 1024) / mem.total * 100
+        
+        logger.debug(f"Memory: System {mem.percent:.0f}%, Our processes {our_memory_pct:.1f}% ({process_rss_mb:.0f}MB), SHM {shm_in_use/1_000_000:.0f}MB")
+        
+        if mem.percent < 50 and our_memory_pct < 20:
+            # Very low pressure and we're not using much
+            if current_max < 2_000_000_000 and shm_in_use > current_max * 0.8:
+                return "increase_aggressive"  # Files are hitting the limit
+        elif mem.percent < 70 and our_memory_pct < 30:
+            # Low pressure - can increase if needed
+            if current_max < 1_500_000_000 and shm_in_use > current_max * 0.9:
+                return "increase_moderate"
+        elif mem.percent > 85 or our_memory_pct > 40:
+            # High pressure or we're using too much
+            return "decrease"
+        elif mem.percent > 90 or our_memory_pct > 50:
+            # Critical - decrease immediately
+            return "decrease_urgent"
+        
+        return None
                                                        
     def remove_hash_worker(self):
         """Remove a hash worker."""
