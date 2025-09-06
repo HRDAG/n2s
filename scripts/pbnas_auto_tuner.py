@@ -267,6 +267,14 @@ class SimpleDBWorker(mp.Process):
         
     def run(self):
         """Main worker loop."""
+        # Configure worker logging
+        if not verbose_mode:
+            logger.remove()
+            logger.add(
+                sys.stdout,
+                level="INFO",
+                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+            )
         logger.info(f"SimpleDBWorker {self.worker_id} started")
         init_connection_pool()
         
@@ -376,6 +384,8 @@ class HashWorker(mp.Process):
         self.stats['queue_time_ms'] = 0
         self.stats['total_time_ms'] = 0
         self.stats['bytes_read'] = 0
+        self.stats['files_reread'] = 0  # Track files that need rereading
+        self.stats['files_in_memory'] = 0  # Track files passed via shared memory
         
     def run(self):
         """Main worker loop."""
@@ -495,6 +505,7 @@ class HashWorker(mp.Process):
                 'size': size,
                 'method': 'shared_memory'
             }, timeout=30)
+            self.stats['files_in_memory'] = self.stats.get('files_in_memory', 0) + 1
             
             queue_time = (time.perf_counter() - t0) * 1000
             self.stats['queue_time_ms'] = self.stats.get('queue_time_ms', 0) + queue_time
@@ -537,6 +548,7 @@ class HashWorker(mp.Process):
                 'size': size,
                 'method': 'reread'
             }, timeout=30)
+            self.stats['files_reread'] = self.stats.get('files_reread', 0) + 1
         except Full:
             logger.warning(f"Compress queue full")
             
@@ -664,8 +676,12 @@ class CompressWorker(mp.Process):
             with disk_io_semaphore:  # Prevent disk thrashing
                 data = file_path.read_bytes()
             
-        # Compress
-        compressed = self.compress_data(data)
+        # Get file metadata
+        file_path = Path("/Volumes") / path
+        mtime = file_path.stat().st_mtime if file_path.exists() else time.time()
+        
+        # Compress with metadata
+        compressed = self.compress_data(data, path, mtime)
         
         # Stage for upload
         self.stage_blob(blob_id, compressed)
@@ -677,8 +693,17 @@ class CompressWorker(mp.Process):
         self.stats['files_compressed'] = self.stats.get('files_compressed', 0) + 1
         self.stats['bytes_compressed'] = self.stats.get('bytes_compressed', 0) + size
         
-    def compress_data(self, data: bytes) -> bytes:
-        """Compress and wrap data as JSON blob."""
+    def compress_data(self, data: bytes, path: str, mtime: float) -> bytes:
+        """Compress and wrap data as JSON blob with proper metadata."""
+        # Detect file type using python-magic (if available)
+        try:
+            import magic
+            mime = magic.from_buffer(data[:8192], mime=True)  # Check first 8KB
+        except ImportError:
+            mime = "application/octet-stream"
+        except Exception:
+            mime = "application/octet-stream"
+            
         # Compress with LZ4
         frames = []
         CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks
@@ -692,16 +717,17 @@ class CompressWorker(mp.Process):
             frames.append(b64_frame)
             offset += CHUNK_SIZE
             
-        # Create JSON blob
+        # Create JSON blob with full metadata
         blob = {
             "content": {
                 "encoding": "lz4-multiframe",
                 "frames": frames
             },
             "metadata": {
+                "path": path,  # Original path for recovery/debugging
                 "size": len(data),
-                "mtime": time.time(),
-                "filetype": "unknown",
+                "mtime": mtime,  # Actual file mtime
+                "filetype": mime,  # Detected MIME type
                 "encryption": False
             }
         }
@@ -894,13 +920,15 @@ class AutoTuningOrchestrator:
         self.upload_workers = []
         self.db_worker = None  # Single DB worker for async operations
         
+        # Create manager first
+        self.manager = mp.Manager()
+        
         # Shared worker stats
         self.hash_stats = []
         self.compress_stats = []
         self.db_stats = self.manager.dict()  # Stats for DB worker
         
         # Tunable thresholds
-        self.manager = mp.Manager()
         # Initial thresholds - will be dynamically adjusted based on memory pressure
         available_ram = psutil.virtual_memory().available
         self.thresholds = self.manager.dict({
@@ -1086,27 +1114,46 @@ class AutoTuningOrchestrator:
             elif recent_files_per_sec[-1] < recent_files_per_sec[0] * 0.9:
                 throughput_trend = "declining"
         
-        # If last action made things worse, blacklist it and try opposite
-        if self.last_tuning_action and throughput_trend == "declining":
-            logger.info(f"🔴 Last tuning made things worse (was {self.last_throughput_before_tuning:.1f} f/s, now {current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s)")
-            
-            # Blacklist the failed action for 5 minutes
-            failed_action = self.last_tuning_action['action'].split('+')[0] if '+' in self.last_tuning_action['action'] else self.last_tuning_action['action']
-            self.action_blacklist[failed_action] = time.time() + 300  # 5 minute blacklist
-            logger.info(f"Blacklisting {failed_action} actions for 5 minutes")
-            
-            # Revert or try opposite
-            if "Hash+" in self.last_tuning_action['action']:
-                # Added hash workers didn't help, try compress
-                if len(self.compress_workers) < MAX_COMPRESS and not self.is_blacklisted("Compress"):
-                    self.spawn_compress_workers(1)
-                    self.record_tuning_action("Compress+1", current_files_per_sec, current_mb_per_sec)
-            elif "Compress+" in self.last_tuning_action['action']:
-                # Added compress didn't help, try hash
-                if len(self.hash_workers) < MAX_HASH and not self.is_blacklisted("Hash"):
-                    self.spawn_hash_workers(1)
-                    self.record_tuning_action("Hash+1", current_files_per_sec, current_mb_per_sec)
-            return
+        # Check if last tuning action actually helped or hurt (after cooldown period)
+        if self.last_tuning_action:
+            time_since_tuning = time.time() - self.last_tuning_action['time']
+            # Only evaluate after cooldown period
+            if time_since_tuning >= self.tuning_cooldown:
+                # Compare current throughput to baseline before tuning
+                improvement_ratio = current_files_per_sec / max(0.1, self.last_throughput_before_tuning)
+                mb_improvement_ratio = current_mb_per_sec / max(0.1, getattr(self, 'last_mb_per_sec_before_tuning', current_mb_per_sec))
+                
+                if improvement_ratio < 0.95 or mb_improvement_ratio < 0.95:  
+                    # Throughput got worse (5% threshold)
+                    logger.info(f"🔴 Last tuning made things worse (was {self.last_throughput_before_tuning:.1f} f/s, now {current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s)")
+                    
+                    # Blacklist the failed action for 5 minutes
+                    failed_action = self.last_tuning_action['action'].split('+')[0] if '+' in self.last_tuning_action['action'] else self.last_tuning_action['action'].split('→')[0]
+                    self.action_blacklist[failed_action] = time.time() + 300  # 5 minute blacklist
+                    logger.info(f"Blacklisting {failed_action} actions for 5 minutes")
+                    
+                    # Revert or try opposite
+                    if "Hash+" in self.last_tuning_action['action']:
+                        # Added hash workers didn't help, try compress
+                        if len(self.compress_workers) < MAX_COMPRESS and not self.is_blacklisted("Compress"):
+                            self.spawn_compress_workers(1)
+                            self.record_tuning_action("Compress+1", current_files_per_sec, current_mb_per_sec)
+                    elif "Compress+" in self.last_tuning_action['action']:
+                        # Added compress didn't help, try hash
+                        if len(self.hash_workers) < MAX_HASH and not self.is_blacklisted("Hash"):
+                            self.spawn_hash_workers(1)
+                            self.record_tuning_action("Hash+1", current_files_per_sec, current_mb_per_sec)
+                    return
+                elif improvement_ratio > 1.05 and mb_improvement_ratio > 0.90:
+                    # Files/sec improved significantly AND MB/sec didn't get much worse
+                    logger.info(f"✅ Last tuning improved throughput (was {self.last_throughput_before_tuning:.1f} f/s, now {current_files_per_sec:.1f} f/s | {current_mb_per_sec:.1f} MB/s)")
+                    # Clear the last action so we can try new things
+                    self.last_tuning_action = None
+                elif improvement_ratio > 0.95 and improvement_ratio <= 1.05:
+                    # Neutral result - throughput stayed about the same
+                    logger.info(f"↔️ Last tuning had neutral effect ({self.last_throughput_before_tuning:.1f} → {current_files_per_sec:.1f} f/s)")
+                    # Clear the action to try something else
+                    self.last_tuning_action = None
         
         # If throughput is improving, maybe try more of the same
         if throughput_trend == "improving" and self.last_tuning_action:
@@ -1123,56 +1170,87 @@ class AutoTuningOrchestrator:
             staged_files = len(list(Path(STAGING_PATH).glob("*/*/*")))
             worker_ratio = len(self.compress_workers) / max(1, len(self.hash_workers))
             
-            # First, check if we can adjust memory thresholds based on pressure
-            mem = psutil.virtual_memory()
-            if mem.percent < 60 and self.thresholds['shared_memory_max'] < 2_000_000_000:
-                # Plenty of memory available, increase threshold (up to 2GB)
-                old_max = self.thresholds['shared_memory_max']
-                new_max = min(2_000_000_000, int(old_max * 1.5))
-                self.thresholds['shared_memory_max'] = new_max
-                logger.info(f"🎯 TUNING: Memory threshold {humanize.naturalsize(old_max)} → {humanize.naturalsize(new_max)} (mem: {mem.percent:.0f}%)")
-                self.record_tuning_action(f"MemMax→{humanize.naturalsize(new_max)}", current_files_per_sec, current_mb_per_sec)
-                return
-            elif mem.percent > 85 and self.thresholds['shared_memory_max'] > 100_000_000:
-                # Memory pressure high, reduce threshold (but keep at least 100MB)
-                old_max = self.thresholds['shared_memory_max']
-                new_max = max(100_000_000, int(old_max * 0.5))
-                self.thresholds['shared_memory_max'] = new_max
-                logger.info(f"🎯 TUNING: Memory threshold {humanize.naturalsize(old_max)} → {humanize.naturalsize(new_max)} (mem: {mem.percent:.0f}% HIGH)")
-                self.record_tuning_action(f"MemMax→{humanize.naturalsize(new_max)}", current_files_per_sec, current_mb_per_sec)
-                return
-            
+            # PRIORITIZE ACTUAL BOTTLENECKS FIRST
             # Decision tree based on bottleneck indicators
+            
+            # 1. Check for upload backlog (highest priority - blocks everything)
             if staged_files > 200:
                 # Backlog at staging - upload is slow
                 if len(self.upload_workers) < MAX_UPLOAD and not self.is_blacklisted("Upload"):
                     self.spawn_upload_workers(1)
                     self.record_tuning_action("Upload+1", current_files_per_sec, current_mb_per_sec)
+                    return
+                    
+            # 2. Check if compress workers are starved (common bottleneck)
             elif compress_idle_pct > 80 or worker_ratio > 1.5:
                 # Compress workers are starved - need more hash workers
                 if len(self.hash_workers) < MAX_HASH and not self.is_blacklisted("Hash"):
                     self.spawn_hash_workers(1)
-                    self.record_tuning_action("Hash+1", current_files_per_sec, current_mb_per_sec)
+                    self.record_tuning_action("Hash+1 (compress starved)", current_files_per_sec, current_mb_per_sec)
+                    return
                 elif worker_ratio > 2 and len(self.compress_workers) > 2:
                     # Too many compress workers, remove one
                     self.remove_compress_worker()
-                    self.record_tuning_action("Compress-1", current_files_per_sec, current_mb_per_sec)
-                elif len(self.hash_workers) > 2:
-                    # Check for disk thrashing and adjust semaphores
-                    is_thrashing, thrash_ratio = self.detect_disk_thrashing()
-                    if is_thrashing and thrash_ratio > 10 and self.thresholds['disk_io_semaphores'] > 1:
-                        # Severe thrashing - reduce semaphores
-                        self.adjust_disk_semaphores(-1)
-                        self.record_tuning_action(f"Semaphores-1→{self.thresholds['disk_io_semaphores']} (thrashing)", current_files_per_sec, current_mb_per_sec)
-                    elif not is_thrashing and self.thresholds['disk_io_semaphores'] < len(self.hash_workers):
-                        # No thrashing and could use more concurrent reads
-                        self.adjust_disk_semaphores(1)
-                        self.record_tuning_action(f"Semaphores+1→{self.thresholds['disk_io_semaphores']}", current_files_per_sec, current_mb_per_sec)
-            else:
-                # Try more compress workers
-                if len(self.compress_workers) < MAX_COMPRESS and worker_ratio < 1.5 and not self.is_blacklisted("Compress"):
+                    self.record_tuning_action("Compress-1 (ratio imbalance)", current_files_per_sec, current_mb_per_sec)
+                    return
+                    
+            # 3. Check if we need more compress workers
+            elif compress_idle_pct < 30 and worker_ratio < 1.5:
+                if len(self.compress_workers) < MAX_COMPRESS and not self.is_blacklisted("Compress"):
                     self.spawn_compress_workers(1)
-                    self.record_tuning_action("Compress+1", current_files_per_sec, current_mb_per_sec)
+                    self.record_tuning_action("Compress+1 (low idle)", current_files_per_sec, current_mb_per_sec)
+                    return
+                    
+            # 4. Check for disk I/O issues
+            if len(self.hash_workers) > 2:
+                is_thrashing, thrash_ratio = self.detect_disk_thrashing()
+                if is_thrashing and thrash_ratio > 10 and self.thresholds['disk_io_semaphores'] > 1:
+                    # Severe thrashing - reduce semaphores
+                    self.adjust_disk_semaphores(-1)
+                    self.record_tuning_action(f"Semaphores-1→{self.thresholds['disk_io_semaphores']} (thrashing)", current_files_per_sec, current_mb_per_sec)
+                    return
+                elif not is_thrashing and self.thresholds['disk_io_semaphores'] < len(self.hash_workers):
+                    # No thrashing and could use more concurrent reads
+                    self.adjust_disk_semaphores(1)
+                    self.record_tuning_action(f"Semaphores+1→{self.thresholds['disk_io_semaphores']}", current_files_per_sec, current_mb_per_sec)
+                    return
+                    
+            # 5. ONLY NOW check memory adjustments - and make them evidence-based
+            mem = psutil.virtual_memory()
+            total_files_processed = sum(s.get('files_processed', 0) for s in self.hash_stats)
+            total_files_reread = sum(s.get('files_reread', 0) for s in self.hash_stats)
+            total_files_in_memory = sum(s.get('files_in_memory', 0) for s in self.hash_stats)
+            
+            # Calculate reread ratio
+            reread_ratio = total_files_reread / max(1, total_files_processed)
+            memory_ratio = total_files_in_memory / max(1, total_files_processed)
+            
+            # Only adjust memory if we have evidence it's needed
+            if mem.percent > 85 and self.thresholds['shared_memory_max'] > 100_000_000:
+                # Memory pressure HIGH - must reduce
+                old_max = self.thresholds['shared_memory_max']
+                new_max = max(100_000_000, int(old_max * 0.5))
+                self.thresholds['shared_memory_max'] = new_max
+                logger.info(f"🎯 TUNING: Memory threshold {humanize.naturalsize(old_max)} → {humanize.naturalsize(new_max)} (mem: {mem.percent:.0f}% HIGH!)")
+                self.record_tuning_action(f"MemMax→{humanize.naturalsize(new_max)} (pressure)", current_files_per_sec, current_mb_per_sec)
+                return
+            elif reread_ratio > 0.3 and mem.percent < 70 and self.thresholds['shared_memory_max'] < 2_000_000_000:
+                # Many rereads happening AND we have memory available - increase threshold
+                old_max = self.thresholds['shared_memory_max']
+                new_max = min(2_000_000_000, int(old_max * 1.5))
+                self.thresholds['shared_memory_max'] = new_max
+                logger.info(f"🎯 TUNING: Memory threshold {humanize.naturalsize(old_max)} → {humanize.naturalsize(new_max)} (rereads: {reread_ratio:.0%})")
+                self.record_tuning_action(f"MemMax→{humanize.naturalsize(new_max)} (rereads)", current_files_per_sec, current_mb_per_sec)
+                return
+                
+            # 6. If nothing else to tune, try small adjustments
+            # Default to trying more hash workers if we're at minimum
+            if len(self.hash_workers) <= 2 and not self.is_blacklisted("Hash"):
+                self.spawn_hash_workers(1)
+                self.record_tuning_action("Hash+1 (probing)", current_files_per_sec, current_mb_per_sec)
+            elif len(self.compress_workers) <= 2 and not self.is_blacklisted("Compress"):
+                self.spawn_compress_workers(1)
+                self.record_tuning_action("Compress+1 (probing)", current_files_per_sec, current_mb_per_sec)
                     
     def record_tuning_action(self, action: str, current_files_per_sec: float, current_mb_per_sec: float):
         """Record what tuning action we took."""
@@ -1684,6 +1762,15 @@ class AutoTuningOrchestrator:
             
         staging_path = Path(STAGING_PATH)
         
+        # Extract blob IDs from filenames (files are named with their blob_id)
+        # The files themselves are JSON blobs with LZ4-compressed content, 
+        # but we don't need to read them - just extract the blob_id from filename
+        blob_ids = []
+        for file_path in remaining_files:
+            # Staged path format: /tmp/n2s_staging/AA/BB/blobid
+            blob_id = file_path.name
+            blob_ids.append(blob_id)
+        
         # Create manifest for rsync
         manifest_path = Path("/tmp/emergency_manifest.txt")
         rel_paths = [str(f.relative_to(staging_path)) for f in remaining_files]
@@ -1705,28 +1792,19 @@ class AutoTuningOrchestrator:
             if result.returncode == 0:
                 logger.info(f"Emergency upload successful: {len(remaining_files)} files")
                 
-                # Mark files as uploaded in database
+                # Mark files as uploaded in database using blob IDs
                 conn = get_db_connection()
                 try:
                     with conn.cursor() as cur:
-                        for file_path in remaining_files:
-                            # Extract original path from staging path structure
-                            # e.g., staging/12/34/1234...json.lz4 -> extract from JSON
-                            try:
-                                with lz4.frame.open(file_path, 'rb') as f:
-                                    metadata = json.load(f)
-                                    original_path = metadata['pth']
-                                    
-                                cur.execute("""
-                                    UPDATE work_queue
-                                    SET uploaded_at = NOW()
-                                    WHERE pth = %s AND uploaded_at IS NULL
-                                """, (original_path,))
-                            except Exception as e:
-                                logger.error(f"Failed to process {file_path}: {e}")
-                                continue
+                        for blob_id in blob_ids:
+                            # Update ALL files with this blob_id as uploaded
+                            cur.execute("""
+                                UPDATE fs 
+                                SET uploaded = NOW()
+                                WHERE blobid = %s AND uploaded IS NULL
+                            """, (blob_id,))
                         conn.commit()
-                        logger.info(f"Updated database for {len(remaining_files)} emergency uploads")
+                        logger.info(f"Updated database for {len(blob_ids)} blob uploads")
                 except Exception as e:
                     logger.error(f"Failed to update DB after emergency upload: {e}")
                     conn.rollback()
